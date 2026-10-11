@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import gzip
 import hmac
+import http.client
 import io
 import json
 import os
@@ -15,7 +16,7 @@ import socket
 import ssl
 import sys
 from dataclasses import asdict, dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Any, Mapping
 import urllib.error
 import urllib.request
@@ -128,25 +129,32 @@ class HttpTransport:
         actual_headers = dict(headers)
         actual_headers["accept-encoding"] = "gzip, deflate"
         request = urllib.request.Request(url, data=body, headers=actual_headers, method="POST")
+        http_status = None
         try:
             with self.opener.open(request, timeout=self.timeout) as response:
+                http_status = response.status
                 if response.status != 200:
                     raise SafeError(f"接口返回 HTTP {response.status}", http_status=response.status)
+                expected_length = response.length
                 raw = response.read(MAX_RESPONSE_BYTES + 1)
                 if len(raw) > MAX_RESPONSE_BYTES:
-                    raise SafeError("接口响应过大")
+                    raise SafeError("接口响应过大", http_status=http_status)
+                if expected_length is not None and len(raw) != expected_length:
+                    raise SafeError("接口响应不完整", http_status=http_status)
                 encoding = response.headers.get("Content-Encoding", "identity").lower()
         except urllib.error.HTTPError as error:
             reason = "登录会话失效或被拒绝" if error.code in (401, 403) else f"接口返回 HTTP {error.code}"
             error.close()
             raise SafeError(reason, http_status=error.code) from None
         except (TimeoutError, socket.timeout):
-            raise SafeError("请求超时") from None
+            raise SafeError("请求超时", http_status=http_status) from None
         except urllib.error.URLError as error:
             reason = "请求超时" if isinstance(error.reason, (TimeoutError, socket.timeout)) else "网络连接失败"
-            raise SafeError(reason) from None
+            raise SafeError(reason, http_status=http_status) from None
+        except http.client.HTTPException:
+            raise SafeError("接口响应不完整", http_status=http_status) from None
         except (OSError, ValueError):
-            raise SafeError("网络请求失败") from None
+            raise SafeError("网络请求失败", http_status=http_status) from None
         try:
             if encoding == "gzip":
                 with gzip.GzipFile(fileobj=io.BytesIO(raw)) as stream:
@@ -155,16 +163,16 @@ class HttpTransport:
                 decompressor = zlib.decompressobj()
                 raw = decompressor.decompress(raw, MAX_RESPONSE_BYTES + 1)
                 if not decompressor.eof and len(raw) <= MAX_RESPONSE_BYTES:
-                    raise SafeError("接口响应格式异常")
+                    raise SafeError("接口响应格式异常", http_status=http_status)
             elif encoding not in ("", "identity"):
-                raise SafeError("接口响应编码不支持")
+                raise SafeError("接口响应编码不支持", http_status=http_status)
             if len(raw) > MAX_RESPONSE_BYTES:
-                raise SafeError("接口响应过大")
+                raise SafeError("接口响应过大", http_status=http_status)
             value = json.loads(raw)
-        except (ValueError, OSError, zlib.error):
-            raise SafeError("接口响应格式异常") from None
+        except (EOFError, ValueError, OSError, zlib.error):
+            raise SafeError("接口响应格式异常", http_status=http_status) from None
         if not isinstance(value, dict):
-            raise SafeError("接口响应格式异常")
+            raise SafeError("接口响应格式异常", http_status=http_status)
         return value
 
 
@@ -317,22 +325,43 @@ def format_message(results: list[Result], today: date) -> tuple[str, str]:
     return f"Hopegoo签到 {today:%m/%d}", "\n".join(lines)
 
 
+def github_run_identity() -> str | None:
+    if os.environ.get("GITHUB_ACTIONS") != "true":
+        return None
+    run_id = os.environ.get("GITHUB_RUN_ID", "")
+    attempt = os.environ.get("GITHUB_RUN_ATTEMPT", "")
+    if not re.fullmatch(r"[0-9]+", run_id) or not re.fullmatch(r"[0-9]+", attempt):
+        return None
+    return run_id + ":" + attempt
+
+
 def write_report(path: Path, results: list[Result], today: date, mode: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(path.name + ".tmp")
     data = {"schema_version": 1, "date": today.isoformat(), "mode": mode, "results": [asdict(item) for item in results]}
+    run_identity = github_run_identity()
+    if run_identity is not None:
+        data["github_run"] = run_identity
     with temporary.open("w", encoding="utf-8") as stream:
         json.dump(data, stream, ensure_ascii=False)
         stream.write("\n")
     temporary.replace(path)
 
 
-def read_report(path: Path, today: date) -> list[Result]:
+def load_report(path: Path, today: date) -> tuple[date, list[Result]]:
     try:
         if path.stat().st_size > 32 * 1024:
             raise ValueError()
         report = json.loads(path.read_text(encoding="utf-8"))
-        if report.get("date") != today.isoformat() or report.get("schema_version") != 1:
+        report_date = date.fromisoformat(report["date"])
+        if report.get("schema_version") != 1:
+            raise ValueError()
+        run_identity = github_run_identity()
+        if run_identity is not None and report.get("github_run") != run_identity:
+            raise ValueError()
+        # A job that starts before midnight may notify just after midnight.
+        # Only the same GitHub run and attempt may use yesterday's report.
+        if report_date != today and (run_identity is None or report_date != today - timedelta(days=1)):
             raise ValueError()
         entries = report["results"]
         if not isinstance(entries, list) or not 1 <= len(entries) <= 10:
@@ -357,9 +386,13 @@ def read_report(path: Path, today: date) -> list[Result]:
             if not isinstance(result.submission_reason, str) or len(result.submission_reason) > 100:
                 raise ValueError()
             results.append(result)
-        return results
+        return report_date, results
     except (OSError, ValueError, TypeError, KeyError, AttributeError):
-        return [Result("01", "failed", reason="脚本未完成，请查看运行记录")]
+        return today, [Result("01", "failed", reason="脚本未完成，请查看运行记录")]
+
+
+def read_report(path: Path, today: date) -> list[Result]:
+    return load_report(path, today)[1]
 
 
 def push_message(environment: Mapping[str, str], transport: HttpTransport, title: str, content: str) -> None:
@@ -434,8 +467,8 @@ def main(argv: list[str] | None = None) -> int:
     today = current_date()
     transport = HttpTransport()
     if args.notify:
-        results = read_report(args.report, today)
-        title, content = format_message(results, today)
+        report_date, results = load_report(args.report, today)
+        title, content = format_message(results, report_date)
         print(title + "\n" + content)
         try:
             push_message(os.environ, transport, title, content)

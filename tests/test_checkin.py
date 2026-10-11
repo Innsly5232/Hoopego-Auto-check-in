@@ -295,6 +295,38 @@ class CheckinTests(unittest.TestCase):
             self.assertNotIn("dummy-key", path.read_text())
             self.assertEqual(checkin.read_report(path, date(2026, 10, 13))[0].status, "failed")
 
+    def test_notification_across_midnight_keeps_same_run_results_and_date(self):
+        transport = FakeTransport({"code": 200})
+        output = io.StringIO()
+        environment = {"GITHUB_ACTIONS": "true", "GITHUB_RUN_ID": "123", "GITHUB_RUN_ATTEMPT": "1",
+                       "PUSHPLUS_TOKEN": "dummy-push"}
+        results = [checkin.Result("01", "success", days=2, coins=5), checkin.Result("02", "already", days=3)]
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict("os.environ", environment, clear=True), \
+                mock.patch("checkin.HttpTransport", return_value=transport), \
+                mock.patch("checkin.current_date", return_value=date(2026, 10, 13)), \
+                contextlib.redirect_stdout(output):
+            path = Path(directory) / "report.json"
+            checkin.write_report(path, results, TODAY, "checkin")
+            code = checkin.main(["--notify", "--report", str(path)])
+        self.assertEqual(code, 0)
+        payload = json.loads(transport.calls[0][2])
+        self.assertEqual(payload["title"], "Hopegoo签到 10/12")
+        self.assertIn("成功1｜已签1｜失败0", payload["content"])
+        self.assertIn("02：今日已签到", payload["content"])
+
+    def test_report_from_other_run_or_attempt_cannot_be_reused(self):
+        environment = {"GITHUB_ACTIONS": "true", "GITHUB_RUN_ID": "123", "GITHUB_RUN_ATTEMPT": "1"}
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict("os.environ", environment, clear=True):
+            path = Path(directory) / "report.json"
+            checkin.write_report(path, [checkin.Result("01", "success", days=2, coins=5)], TODAY, "checkin")
+            for replacement in ({"GITHUB_RUN_ID": "124"}, {"GITHUB_RUN_ATTEMPT": "2"}):
+                with self.subTest(replacement=replacement), mock.patch.dict("os.environ", replacement):
+                    for notification_date in (TODAY, date(2026, 10, 13)):
+                        self.assertEqual(checkin.read_report(path, notification_date)[0].status, "failed")
+            # Matching run metadata still cannot authorize a future or very old report.
+            for notification_date in (date(2026, 10, 11), date(2026, 10, 14)):
+                self.assertEqual(checkin.read_report(path, notification_date)[0].status, "failed")
+
     def test_missing_report_still_creates_failure_notification(self):
         results = checkin.read_report(Path("not-a-real-report.json"), TODAY)
         title, content = checkin.format_message(results, TODAY)
@@ -361,6 +393,21 @@ class TransportTests(unittest.TestCase):
                     return
                 raw = gzip.compress(json.dumps({"status": 200, "body": {"coins": 5}}).encode())
                 self.send_response(200)
+                if self.path == "/truncated-chunked":
+                    self.send_header("Transfer-Encoding", "chunked")
+                    self.end_headers()
+                    self.wfile.write(b"40\r\n{\"status\":200}")
+                    return
+                if self.path == "/truncated-length":
+                    raw = b'{"status":200,"body":{}}'
+                    self.send_header("Content-Length", str(len(raw) + 12))
+                    self.end_headers()
+                    self.wfile.write(raw)
+                    return
+                if self.path == "/truncated-gzip":
+                    raw = raw[:-8]
+                if self.path == "/expanded-too-large":
+                    raw = gzip.compress(b"x" * (checkin.MAX_RESPONSE_BYTES + 1))
                 self.send_header("Content-Encoding", "gzip")
                 self.send_header("Content-Length", str(len(raw)))
                 self.end_headers()
@@ -393,6 +440,38 @@ class TransportTests(unittest.TestCase):
         self.assertEqual(raised.exception.http_status, 403)
         self.assertEqual(str(raised.exception), "登录会话失效或被拒绝")
         self.assertNotIn("untrusted-dummy-backend-text", str(raised.exception))
+
+    def test_incomplete_submission_still_queries_and_never_retries(self):
+        for path in ("/truncated-gzip", "/truncated-length", "/truncated-chunked"):
+            with self.subTest(path=path):
+                network = checkin.HttpTransport(timeout=2)
+                before = len(self.seen)
+                calls = []
+                base = self.base
+
+                class SubmissionTransport:
+                    def post(self, url, headers, body):
+                        calls.append(url)
+                        if url == checkin.SIGNIN_URL:
+                            return network.post(base + path, headers, body)
+                        return calendar(len(calls) > 1, 1)
+
+                account = checkin.Account.from_secret(secret(), 1)
+                result = checkin.check_account(account, SubmissionTransport(), "checkin", TODAY)
+                self.assertEqual(result.status, "uncertain")
+                self.assertEqual(result.submission_status, "unknown")
+                self.assertEqual(result.submission_http, 200)
+                self.assertEqual(result.days, 1)
+                self.assertIsNone(result.coins)
+                self.assertIn("当天已签到，提交响应未确认", result.reason)
+                self.assertEqual(calls, [checkin.QUERY_URL, checkin.SIGNIN_URL, checkin.QUERY_URL])
+                self.assertEqual(self.seen[before:], [(path, b"opaque-signin++==")])
+
+    def test_compressed_response_cannot_exceed_expanded_limit(self):
+        with self.assertRaises(checkin.SafeError) as raised:
+            checkin.HttpTransport(timeout=2).post(self.base + "/expanded-too-large", {}, b"opaque")
+        self.assertEqual(str(raised.exception), "接口响应过大")
+        self.assertEqual(raised.exception.http_status, 200)
 
 
 if __name__ == "__main__":
