@@ -19,5 +19,11 @@ curl --proto '=https' --tlsv1.2 --location --fail --silent --show-error \
   --output "$lint_tmp/$archive"
 printf '%s  %s\n' "$checksum" "$lint_tmp/$archive" | sha256sum --check --status
 tar --extract --gzip --file "$lint_tmp/$archive" --directory "$lint_tmp" actionlint
-"$lint_tmp/actionlint" -shellcheck= -pyflakes= "$repo_root/.github/workflows/hopegoo-checkin.yml"
+shopt -s nullglob
+workflows=("$repo_root"/.github/workflows/*.yml "$repo_root"/.github/workflows/*.yaml)
+if (( ${#workflows[@]} == 0 )); then
+  echo 'No GitHub Actions workflows found.' >&2
+  exit 1
+fi
+"$lint_tmp/actionlint" -shellcheck= -pyflakes= "${workflows[@]}"
 echo 'GitHub Actions configuration passed actionlint.'

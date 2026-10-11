@@ -5,17 +5,6 @@ on:
     # UTC 16:08 = 北京时间下一天 00:08。
     - cron: '8 16 * * *'
   workflow_dispatch:
-    inputs:
-      mode:
-        description: 'query 只查询；checkin 查询后提交当天未完成的签到'
-        required: true
-        default: query
-        type: choice
-        options:
-          - query
-          - checkin
-  push:
-    branches: [main]
 
 permissions:
   contents: read
@@ -25,25 +14,8 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  validate:
-    name: Offline validation
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-      - name: Validate GitHub Actions configuration
-        run: bash tools/validate-workflow.sh
-      - uses: actions/setup-python@v6
-        with:
-          python-version: '3.13'
-      - name: Verify account and notification behavior
-        run: python -m unittest discover -s tests -v
-      - name: Verify local HAR importer
-        run: node tests/verify-importer.cjs
-
   checkin:
-    name: Check in and send SMS
-    needs: validate
-    if: always() && github.event_name != 'push'
+    name: Online Hopegoo check-in and SMS
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
@@ -51,10 +23,8 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: '3.13'
-      - name: Query or check in
-        if: needs.validate.result == 'success'
+      - name: Online check-in and verify
         env:
-          RUN_MODE: ${{ github.event_name == 'schedule' && 'checkin' || inputs.mode || 'query' }}
           HOPEGOO_ACCOUNT_01: ${{ secrets.HOPEGOO_ACCOUNT_01 }}
           HOPEGOO_ACCOUNT_02: ${{ secrets.HOPEGOO_ACCOUNT_02 }}
           HOPEGOO_ACCOUNT_03: ${{ secrets.HOPEGOO_ACCOUNT_03 }}
@@ -65,7 +35,7 @@ jobs:
           HOPEGOO_ACCOUNT_08: ${{ secrets.HOPEGOO_ACCOUNT_08 }}
           HOPEGOO_ACCOUNT_09: ${{ secrets.HOPEGOO_ACCOUNT_09 }}
           HOPEGOO_ACCOUNT_10: ${{ secrets.HOPEGOO_ACCOUNT_10 }}
-        run: python checkin.py --mode "$RUN_MODE" --report "$RUNNER_TEMP/hopegoo-report.json"
+        run: python checkin.py --mode checkin --report "$RUNNER_TEMP/hopegoo-report.json"
       - name: Always submit cmcc SMS summary
         if: always()
         env:
@@ -104,8 +74,9 @@ jobs:
           fi
 
   keepalive:
-    name: Keep scheduled workflow active
-    if: github.event_name == 'schedule'
+    name: Public repository maintenance
+    # Inactivity disables scheduled workflows in public repositories only.
+    if: github.event_name == 'schedule' && github.event.repository.visibility == 'public'
     runs-on: ubuntu-latest
     permissions:
       actions: write

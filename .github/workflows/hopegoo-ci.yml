@@ -1,0 +1,31 @@
+name: Hopegoo code checks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hopegoo-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: Validate code and workflows
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+      - name: Validate GitHub Actions configuration
+        run: bash tools/validate-workflow.sh
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - name: Verify account and notification behavior
+        run: python -m unittest discover -s tests -v
+      - name: Verify local HAR importer
+        run: node tests/verify-importer.cjs

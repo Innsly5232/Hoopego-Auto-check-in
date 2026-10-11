@@ -39,6 +39,10 @@ DROP_HEADERS = {
 class SafeError(Exception):
     """Only messages created by this program, never raw service responses."""
 
+    def __init__(self, message: str, *, http_status: int | None = None):
+        super().__init__(message)
+        self.http_status = http_status
+
 
 def is_int(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
@@ -127,7 +131,7 @@ class HttpTransport:
         try:
             with self.opener.open(request, timeout=self.timeout) as response:
                 if response.status != 200:
-                    raise SafeError(f"接口返回 HTTP {response.status}")
+                    raise SafeError(f"接口返回 HTTP {response.status}", http_status=response.status)
                 raw = response.read(MAX_RESPONSE_BYTES + 1)
                 if len(raw) > MAX_RESPONSE_BYTES:
                     raise SafeError("接口响应过大")
@@ -135,7 +139,7 @@ class HttpTransport:
         except urllib.error.HTTPError as error:
             reason = "登录会话失效或被拒绝" if error.code in (401, 403) else f"接口返回 HTTP {error.code}"
             error.close()
-            raise SafeError(reason) from None
+            raise SafeError(reason, http_status=error.code) from None
         except (TimeoutError, socket.timeout):
             raise SafeError("请求超时") from None
         except urllib.error.URLError as error:
@@ -166,7 +170,9 @@ class HttpTransport:
 
 def business_body(value: dict[str, Any]) -> dict[str, Any]:
     if not is_int(value.get("status")) or value["status"] != 200:
-        raise SafeError("接口拒绝请求，需核对会话")
+        code = value.get("status")
+        reason = f"接口返回业务 status={code}" if is_int(code) and 0 <= code <= 1000000 else "接口业务状态异常"
+        raise SafeError(reason)
     if not isinstance(value.get("body"), dict):
         raise SafeError("接口业务数据缺失")
     return value["body"]
@@ -204,6 +210,10 @@ class Result:
     days: int | None = None
     coins: int | None = None
     reason: str = ""
+    submission_status: str = "not_sent"
+    submission_http: int | None = None
+    submission_code: int | None = None
+    submission_reason: str = ""
 
 
 def query_account(account: Account, transport: HttpTransport, today: date) -> CalendarState:
@@ -216,32 +226,55 @@ def check_account(account: Account, transport: HttpTransport, mode: str, today: 
         before = query_account(account, transport, today)
     except SafeError as error:
         return Result(account.label, "failed", reason=str(error))
-    if before.signed:
-        return Result(account.label, "already", days=before.days)
     if mode == "query":
+        if before.signed:
+            return Result(account.label, "already", days=before.days)
         return Result(account.label, "query_only", days=before.days)
 
     coins = None
     submission_error = None
+    submission_http = None
+    submission_code = None
+    submission_status = "unknown"
     try:
         request = account.signin
-        body = business_body(transport.post(request.url, request.headers, request.body))
+        response = transport.post(request.url, request.headers, request.body)
+        submission_http = 200
+        code = response.get("status")
+        if is_int(code) and 0 <= code <= 1000000:
+            submission_code = code
+        body = business_body(response)
         reward = body.get("coins")
         if is_int(reward) and 0 <= reward <= 1000000:
             coins = reward
+        submission_status = "accepted"
     except SafeError as error:
         submission_error = str(error)
+        submission_http = error.http_status or submission_http
+        if (submission_http is not None and submission_http != 200) or (submission_code is not None and submission_code != 200):
+            submission_status = "rejected"
+    submission = {
+        "submission_status": submission_status,
+        "submission_http": submission_http,
+        "submission_code": submission_code,
+        "submission_reason": submission_error or "",
+    }
 
     # Exactly one submission. Even a timeout may mean the server processed it.
     try:
         after = query_account(account, transport, today)
-    except SafeError:
-        return Result(account.label, "uncertain", reason="提交结果待核实，请查看运行记录")
+    except SafeError as error:
+        return Result(account.label, "uncertain", reason="提交后查询未通过，" + str(error), **submission)
     if after.signed:
-        if submission_error and submission_error != "请求超时":
-            return Result(account.label, "already", days=after.days)
-        return Result(account.label, "success", days=after.days, coins=coins)
-    return Result(account.label, "failed", days=after.days, reason=submission_error or "提交后仍未签到")
+        if submission_status == "rejected":
+            return Result(account.label, "failed", days=after.days, reason="当天已签到，提交接口返回失败，" + submission_error, **submission)
+        if submission_status == "unknown":
+            return Result(account.label, "uncertain", days=after.days, reason="当天已签到，提交响应未确认，" + submission_error, **submission)
+        if before.signed:
+            # A replay of an already signed day does not prove a new reward.
+            return Result(account.label, "already", days=after.days, reason="重复提交已接受", **submission)
+        return Result(account.label, "success", days=after.days, coins=coins, **submission)
+    return Result(account.label, "failed", days=after.days, reason=submission_error or "提交后仍未签到", **submission)
 
 
 def run_accounts(environment: Mapping[str, str], transport: HttpTransport, mode: str, today: date) -> list[Result]:
@@ -274,6 +307,8 @@ def format_message(results: list[Result], today: date) -> tuple[str, str]:
             text = f"成功，{reward}，连续{days}"
         elif item.status == "already":
             text = f"今日已签到，连续{days}"
+            if item.reason:
+                text += "，" + item.reason
         elif item.status == "query_only":
             text = f"尚未签到（仅查询），连续{days}"
         else:
@@ -313,6 +348,14 @@ def read_report(path: Path, today: date) -> list[Result]:
                 raise ValueError()
             if not isinstance(result.reason, str) or len(result.reason) > 100:
                 raise ValueError()
+            if result.submission_status not in ("not_sent", "accepted", "rejected", "unknown"):
+                raise ValueError()
+            if result.submission_http is not None and (not is_int(result.submission_http) or not 100 <= result.submission_http <= 599):
+                raise ValueError()
+            if result.submission_code is not None and (not is_int(result.submission_code) or not 0 <= result.submission_code <= 1000000):
+                raise ValueError()
+            if not isinstance(result.submission_reason, str) or len(result.submission_reason) > 100:
+                raise ValueError()
             results.append(result)
         return results
     except (OSError, ValueError, TypeError, KeyError, AttributeError):
@@ -330,6 +373,29 @@ def push_message(environment: Mapping[str, str], transport: HttpTransport, title
     response = transport.post(PUSH_URL, {"content-type": "application/json; charset=utf-8"}, json.dumps(payload, ensure_ascii=False).encode())
     if not is_int(response.get("code")) or response["code"] != 200:
         raise SafeError("PushPlus 未接受通知，请检查 Token、渠道及额度")
+
+
+def append_step_summary(text: str) -> None:
+    path = os.environ.get("GITHUB_STEP_SUMMARY")
+    if path:
+        try:
+            with Path(path).open("a", encoding="utf-8") as stream:
+                stream.write(text + "\n")
+        except OSError:
+            print("运行摘要写入失败；详细结果仍见步骤日志。", file=sys.stderr)
+
+
+def summarize_results(results: list[Result], today: date) -> None:
+    title, content = format_message(results, today)
+    lines = [f"### {title}", "", "```text", content, "```", "",
+             "| 账号 | 本次签到提交 | HTTP | 业务 status |",
+             "| --- | --- | --- | --- |"]
+    labels = {"not_sent": "未提交", "accepted": "接口已接受", "rejected": "接口返回失败", "unknown": "响应未确认"}
+    for item in results:
+        http = "未知" if item.submission_http is None else str(item.submission_http)
+        code = "未知" if item.submission_code is None else str(item.submission_code)
+        lines.append(f"| {item.label} | {labels[item.submission_status]} | {http} | {code} |")
+    append_step_summary("\n".join(lines))
 
 
 def mask_credentials(environment: Mapping[str, str]) -> None:
@@ -375,14 +441,33 @@ def main(argv: list[str] | None = None) -> int:
             push_message(os.environ, transport, title, content)
         except SafeError as error:
             print(str(error), file=sys.stderr)
+            append_step_summary("\n**短信提交失败：**" + str(error))
             return 1
         except Exception:
             print("通知步骤执行异常", file=sys.stderr)
+            append_step_summary("\n**短信提交失败：**通知步骤执行异常")
             return 1
         print("PushPlus 已接受通知请求；最终送达状态请在 PushPlus 查询。")
+        append_step_summary("\n**短信：**PushPlus 已接受 cmcc 通知请求；最终送达以手机和 PushPlus 记录为准。")
         return 0
+    descriptions = {
+        "query": "联网查询，不提交签到",
+        "checkin": "联网签到，当天已签也提交一次，随后查询确认",
+    }
+    print(f"运行模式：{args.mode}（{descriptions[args.mode]}）")
+    print(f"运行日期（北京时间）：{today.isoformat()}")
     results = run_accounts(os.environ, transport, args.mode, today)
     write_report(args.report, results, today, args.mode)
+    summarize_results(results, today)
+    for item in results:
+        if item.submission_status == "accepted":
+            print(f"{item.label}：签到提交接口通过（HTTP 200，业务 status={item.submission_code}）")
+        elif item.submission_status in ("rejected", "unknown"):
+            http = f"HTTP {item.submission_http}，" if item.submission_http is not None else ""
+            detail = "签到提交接口返回失败" if item.submission_status == "rejected" else "签到提交响应未确认"
+            print(f"{item.label}：{detail}（{http}{item.submission_reason}）")
+        elif args.mode == "checkin":
+            print(f"{item.label}：未提交签到请求，前置查询或账号配置未通过")
     title, content = format_message(results, today)
     print(title + "\n" + content)
     return int(any(item.status in ("failed", "uncertain") for item in results))
