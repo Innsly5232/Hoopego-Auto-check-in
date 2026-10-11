@@ -30,6 +30,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+      - name: Validate GitHub Actions configuration
+        run: bash tools/validate-workflow.sh
       - uses: actions/setup-python@v6
         with:
           python-version: '3.13'
@@ -44,8 +46,6 @@ jobs:
     if: always() && github.event_name != 'push'
     runs-on: ubuntu-latest
     timeout-minutes: 25
-    env:
-      REPORT_PATH: ${{ runner.temp }}/hopegoo-report.json
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v6
@@ -65,7 +65,7 @@ jobs:
           HOPEGOO_ACCOUNT_08: ${{ secrets.HOPEGOO_ACCOUNT_08 }}
           HOPEGOO_ACCOUNT_09: ${{ secrets.HOPEGOO_ACCOUNT_09 }}
           HOPEGOO_ACCOUNT_10: ${{ secrets.HOPEGOO_ACCOUNT_10 }}
-        run: python checkin.py --mode "$RUN_MODE" --report "$REPORT_PATH"
+        run: python checkin.py --mode "$RUN_MODE" --report "$RUNNER_TEMP/hopegoo-report.json"
       - name: Always submit cmcc SMS summary
         if: always()
         env:
@@ -74,7 +74,7 @@ jobs:
         shell: bash
         run: |
           if [ -f checkin.py ]; then
-            /usr/bin/python3 checkin.py --notify --report "$REPORT_PATH"
+            /usr/bin/python3 checkin.py --notify --report "$RUNNER_TEMP/hopegoo-report.json"
           else
             # Checkout failure: notification still runs without project files.
             /usr/bin/python3 - <<'PY'

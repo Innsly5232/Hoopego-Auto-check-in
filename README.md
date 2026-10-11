@@ -72,7 +72,7 @@ cmcc 已固定在脚本里，**不需要填写 `PUSHPLUS_CHANNEL`**。如果原�
 
 每个账号先查询，只有当天日历日期正确、业务状态正常且 `todayStatus=0` 时才提交一次签到，再查询确认 `todayStatus=1`。当天已签到则跳过。提交请求超时也不盲目重试，优先查询核对；奖励无法确定时写“奖励未知”。各账号独立处理，一个失败不阻止其他账号。
 
-通知步骤使用 `always()`：签到脚本、离线验证或启动步骤失败时生成失败摘要并尝试提交短信。未配置 `PUSHPLUS_TOKEN`、通知服务拒绝请求等情况会在运行记录明确报错。定时工作流保活独立执行，权限仅用于保活；账号和通知密钥不交给该步骤。
+通知步骤使用 `always()`：运行启动后，签到脚本、离线验证或 checkout 等步骤失败时生成失败摘要并尝试提交短信。工作流配置无法解析时，GitHub 不会启动任何步骤，也无法发送短信。专用 actionlint 校验用于提前发现此类配置错误。未配置 `PUSHPLUS_TOKEN`、通知服务拒绝请求等情况会在运行记录明确报错。定时工作流保活独立执行，权限仅用于保活；账号和通知密钥不交给该步骤。
 
 在收到跨日结果后再判断初版是否可用。登录会话或编码请求过期时，重新登录、正常操作捕获新的同账号查询和签到 HAR，再用导入工具更新该账号 Secret。短信会提示脱敏错误，不会暴露会话值。
 
@@ -118,5 +118,7 @@ node tests/verify-importer.cjs
 ```
 
 这些检查使用模拟会话和本地 HTTP 服务，不验证真实账号或短信送达。工作流运行时用 Python 3.13。
+
+工作流还运行固定版本、SHA-256 校验后的 actionlint，检查 GitHub Actions 语法和表达式上下文。在 Linux amd64 上可运行 `bash tools/validate-workflow.sh`；它需要联网下载校验工具，但不会读取账号 Secrets。
 
 本地 CLI 默认只查询：`python checkin.py --mode query --report hopegoo-report.json`。签到需显式使用 `--mode checkin`。通知为独立命令：`python checkin.py --notify --report hopegoo-report.json`。账号配置从环境变量读取；不要将真实值写进命令行、仓库文件或测试。
