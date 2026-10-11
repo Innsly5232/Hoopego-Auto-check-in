@@ -285,8 +285,10 @@ class CheckinTests(unittest.TestCase):
         _, content = checkin.format_message([checkin.Result("01", "success", days=2)], TODAY)
         self.assertIn("奖励未知", content)
 
-    def test_report_contains_only_sanitized_results(self):
-        with tempfile.TemporaryDirectory() as directory:
+    def test_local_report_contains_sanitized_results_and_rejects_another_date(self):
+        # Test the local CLI rule independently of the runner's GitHub identity.
+        # The separate midnight test covers the same GitHub run's date exception.
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict("os.environ", {}, clear=True):
             path = Path(directory) / "report.json"
             result = checkin.Result("01", "already", days=2)
             checkin.write_report(path, [result], TODAY, "checkin")
