@@ -1,0 +1,392 @@
+#!/usr/bin/env python3
+"""Replay user-owned Hopegoo captures; keep all credential values out of reports."""
+
+from __future__ import annotations
+
+import argparse
+import gzip
+import hmac
+import io
+import json
+import os
+from pathlib import Path
+import re
+import socket
+import ssl
+import sys
+from dataclasses import asdict, dataclass
+from datetime import date, datetime
+from typing import Any, Mapping
+import urllib.error
+import urllib.request
+from zoneinfo import ZoneInfo
+import zlib
+
+
+SHANGHAI = ZoneInfo("Asia/Shanghai")
+QUERY_URL = "https://app.hopegoo.com/sea_shell/manta-you/memberCheckin/listCheckin"
+SIGNIN_URL = "https://app.hopegoo.com/sea_shell/manta-you/memberCheckin/performCheckin"
+PUSH_URL = "https://www.pushplus.plus/send"
+MAX_RESPONSE_BYTES = 1024 * 1024
+MAX_SECRET_BYTES = 48 * 1024
+DROP_HEADERS = {
+    "host", "content-length", "accept-encoding", "connection", "keep-alive",
+    "proxy-authenticate", "proxy-authorization", "te", "trailer",
+    "transfer-encoding", "upgrade",
+}
+
+
+class SafeError(Exception):
+    """Only messages created by this program, never raw service responses."""
+
+
+def is_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def current_date() -> date:
+    return datetime.now(SHANGHAI).date()
+
+
+@dataclass(frozen=True)
+class CapturedRequest:
+    url: str
+    headers: dict[str, str]
+    body: bytes
+
+    @classmethod
+    def from_config(cls, config: Any, expected_url: str) -> CapturedRequest:
+        if not isinstance(config, dict) or config.get("url") != expected_url or config.get("method") != "POST":
+            raise SafeError("请求配置不匹配")
+        raw_headers = config.get("headers")
+        body = config.get("body")
+        if not isinstance(raw_headers, dict) or not isinstance(body, str) or not body:
+            raise SafeError("请求配置不完整")
+        headers: dict[str, str] = {}
+        for key, value in raw_headers.items():
+            if not isinstance(key, str) or not isinstance(value, str):
+                raise SafeError("请求头格式无效")
+            key = key.lower()
+            if key.startswith(":"):
+                continue
+            if not re.fullmatch(r"[!#$%&'*+.^_`|~0-9a-z-]+", key) or re.search(r"[\r\n\x00]", value):
+                raise SafeError("请求头格式无效")
+            if key in DROP_HEADERS:
+                continue
+            if key in headers:
+                raise SafeError("请求头重复")
+            headers[key] = value
+        if not headers.get("hopegoo-token") or not headers.get("hopegoo-encryptkey"):
+            raise SafeError("登录或加密配置缺失")
+        if headers.get("content-encoding", "identity").lower() != "identity":
+            raise SafeError("请求体编码需重新核对")
+        return cls(expected_url, headers, body.encode("utf-8"))
+
+
+@dataclass(frozen=True)
+class Account:
+    label: str
+    query: CapturedRequest
+    signin: CapturedRequest
+
+    @classmethod
+    def from_secret(cls, raw: str, slot: int) -> Account:
+        if len(raw.encode("utf-8")) > MAX_SECRET_BYTES:
+            raise SafeError("账号配置超过大小限制")
+        try:
+            value = json.loads(raw)
+        except (ValueError, TypeError):
+            raise SafeError("账号配置不是有效 JSON") from None
+        if not isinstance(value, dict) or not is_int(value.get("schema_version")) or value["schema_version"] != 1:
+            raise SafeError("账号配置版本不支持")
+        query = CapturedRequest.from_config(value.get("query"), QUERY_URL)
+        signin = CapturedRequest.from_config(value.get("signin"), SIGNIN_URL)
+        if not hmac.compare_digest(query.headers["hopegoo-token"].encode(), signin.headers["hopegoo-token"].encode()):
+            raise SafeError("两个请求的登录会话不一致")
+        return cls(f"{slot:02d}", query, signin)
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+class HttpTransport:
+    """TLS verification stays enabled; no redirects or automatic POST retries."""
+
+    def __init__(self, timeout: float = 30):
+        self.timeout = timeout
+        self.opener = urllib.request.build_opener(
+            urllib.request.HTTPSHandler(context=ssl.create_default_context()), NoRedirect()
+        )
+
+    def post(self, url: str, headers: Mapping[str, str], body: bytes) -> dict[str, Any]:
+        actual_headers = dict(headers)
+        actual_headers["accept-encoding"] = "gzip, deflate"
+        request = urllib.request.Request(url, data=body, headers=actual_headers, method="POST")
+        try:
+            with self.opener.open(request, timeout=self.timeout) as response:
+                if response.status != 200:
+                    raise SafeError(f"接口返回 HTTP {response.status}")
+                raw = response.read(MAX_RESPONSE_BYTES + 1)
+                if len(raw) > MAX_RESPONSE_BYTES:
+                    raise SafeError("接口响应过大")
+                encoding = response.headers.get("Content-Encoding", "identity").lower()
+        except urllib.error.HTTPError as error:
+            reason = "登录会话失效或被拒绝" if error.code in (401, 403) else f"接口返回 HTTP {error.code}"
+            error.close()
+            raise SafeError(reason) from None
+        except (TimeoutError, socket.timeout):
+            raise SafeError("请求超时") from None
+        except urllib.error.URLError as error:
+            reason = "请求超时" if isinstance(error.reason, (TimeoutError, socket.timeout)) else "网络连接失败"
+            raise SafeError(reason) from None
+        except (OSError, ValueError):
+            raise SafeError("网络请求失败") from None
+        try:
+            if encoding == "gzip":
+                with gzip.GzipFile(fileobj=io.BytesIO(raw)) as stream:
+                    raw = stream.read(MAX_RESPONSE_BYTES + 1)
+            elif encoding == "deflate":
+                decompressor = zlib.decompressobj()
+                raw = decompressor.decompress(raw, MAX_RESPONSE_BYTES + 1)
+                if not decompressor.eof and len(raw) <= MAX_RESPONSE_BYTES:
+                    raise SafeError("接口响应格式异常")
+            elif encoding not in ("", "identity"):
+                raise SafeError("接口响应编码不支持")
+            if len(raw) > MAX_RESPONSE_BYTES:
+                raise SafeError("接口响应过大")
+            value = json.loads(raw)
+        except (ValueError, OSError, zlib.error):
+            raise SafeError("接口响应格式异常") from None
+        if not isinstance(value, dict):
+            raise SafeError("接口响应格式异常")
+        return value
+
+
+def business_body(value: dict[str, Any]) -> dict[str, Any]:
+    if not is_int(value.get("status")) or value["status"] != 200:
+        raise SafeError("接口拒绝请求，需核对会话")
+    if not isinstance(value.get("body"), dict):
+        raise SafeError("接口业务数据缺失")
+    return value["body"]
+
+
+@dataclass(frozen=True)
+class CalendarState:
+    signed: bool
+    days: int
+
+
+def calendar_state(response: dict[str, Any], today: date) -> CalendarState:
+    body = business_body(response)
+    status, days = body.get("todayStatus"), body.get("continuousDays")
+    if not is_int(status) or status not in (0, 1) or not is_int(days) or not 0 <= days <= 100000:
+        raise SafeError("签到状态无法识别")
+    calendar = body.get("checkinInfoList")
+    if not isinstance(calendar, list):
+        raise SafeError("签到日历缺失")
+    entries = [item for item in calendar if isinstance(item, dict) and is_int(item.get("today")) and item["today"] == 1]
+    if len(entries) != 1:
+        raise SafeError("当天日历无法识别")
+    item = entries[0]
+    if item.get("dateText2") != today.isoformat():
+        raise SafeError("返回日期不是今天")
+    if not is_int(item.get("status")) or item["status"] != status:
+        raise SafeError("当天签到状态不一致")
+    return CalendarState(status == 1, days)
+
+
+@dataclass
+class Result:
+    label: str
+    status: str
+    days: int | None = None
+    coins: int | None = None
+    reason: str = ""
+
+
+def query_account(account: Account, transport: HttpTransport, today: date) -> CalendarState:
+    request = account.query
+    return calendar_state(transport.post(request.url, request.headers, request.body), today)
+
+
+def check_account(account: Account, transport: HttpTransport, mode: str, today: date) -> Result:
+    try:
+        before = query_account(account, transport, today)
+    except SafeError as error:
+        return Result(account.label, "failed", reason=str(error))
+    if before.signed:
+        return Result(account.label, "already", days=before.days)
+    if mode == "query":
+        return Result(account.label, "query_only", days=before.days)
+
+    coins = None
+    submission_error = None
+    try:
+        request = account.signin
+        body = business_body(transport.post(request.url, request.headers, request.body))
+        reward = body.get("coins")
+        if is_int(reward) and 0 <= reward <= 1000000:
+            coins = reward
+    except SafeError as error:
+        submission_error = str(error)
+
+    # Exactly one submission. Even a timeout may mean the server processed it.
+    try:
+        after = query_account(account, transport, today)
+    except SafeError:
+        return Result(account.label, "uncertain", reason="提交结果待核实，请查看运行记录")
+    if after.signed:
+        if submission_error and submission_error != "请求超时":
+            return Result(account.label, "already", days=after.days)
+        return Result(account.label, "success", days=after.days, coins=coins)
+    return Result(account.label, "failed", days=after.days, reason=submission_error or "提交后仍未签到")
+
+
+def run_accounts(environment: Mapping[str, str], transport: HttpTransport, mode: str, today: date) -> list[Result]:
+    results = []
+    for slot in range(1, 11):
+        raw = environment.get(f"HOPEGOO_ACCOUNT_{slot:02d}", "")
+        if not raw:
+            continue
+        try:
+            account = Account.from_secret(raw, slot)
+            results.append(check_account(account, transport, mode, today))
+        except SafeError as error:
+            results.append(Result(f"{slot:02d}", "failed", reason=str(error)))
+        except Exception:
+            results.append(Result(f"{slot:02d}", "failed", reason="脚本执行异常，请查看运行记录"))
+    return results or [Result("01", "failed", reason="账号配置缺失，请填写 GitHub Secret")]
+
+
+def format_message(results: list[Result], today: date) -> tuple[str, str]:
+    counts = {key: sum(item.status == key for item in results) for key in ("success", "already", "query_only")}
+    failed = sum(item.status in ("failed", "uncertain") for item in results)
+    first = f"成功{counts['success']}｜已签{counts['already']}｜失败{failed}"
+    if counts["query_only"]:
+        first += f"｜待签{counts['query_only']}"
+    lines = [first]
+    for item in results:
+        days = "未知" if item.days is None else f"{item.days}天"
+        if item.status == "success":
+            reward = "奖励未知" if item.coins is None else f"+{item.coins} G-coins"
+            text = f"成功，{reward}，连续{days}"
+        elif item.status == "already":
+            text = f"今日已签到，连续{days}"
+        elif item.status == "query_only":
+            text = f"尚未签到（仅查询），连续{days}"
+        else:
+            text = f"失败，{item.reason or '结果未知'}"
+        lines.append(f"{item.label}：{text}")
+    return f"Hopegoo签到 {today:%m/%d}", "\n".join(lines)
+
+
+def write_report(path: Path, results: list[Result], today: date, mode: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".tmp")
+    data = {"schema_version": 1, "date": today.isoformat(), "mode": mode, "results": [asdict(item) for item in results]}
+    with temporary.open("w", encoding="utf-8") as stream:
+        json.dump(data, stream, ensure_ascii=False)
+        stream.write("\n")
+    temporary.replace(path)
+
+
+def read_report(path: Path, today: date) -> list[Result]:
+    try:
+        if path.stat().st_size > 32 * 1024:
+            raise ValueError()
+        report = json.loads(path.read_text(encoding="utf-8"))
+        if report.get("date") != today.isoformat() or report.get("schema_version") != 1:
+            raise ValueError()
+        entries = report["results"]
+        if not isinstance(entries, list) or not 1 <= len(entries) <= 10:
+            raise ValueError()
+        results = []
+        for item in entries:
+            result = Result(**item)
+            if not re.fullmatch(r"0[1-9]|10", result.label) or result.status not in ("success", "already", "query_only", "failed", "uncertain"):
+                raise ValueError()
+            if result.days is not None and (not is_int(result.days) or not 0 <= result.days <= 100000):
+                raise ValueError()
+            if result.coins is not None and (not is_int(result.coins) or not 0 <= result.coins <= 1000000):
+                raise ValueError()
+            if not isinstance(result.reason, str) or len(result.reason) > 100:
+                raise ValueError()
+            results.append(result)
+        return results
+    except (OSError, ValueError, TypeError, KeyError, AttributeError):
+        return [Result("01", "failed", reason="脚本未完成，请查看运行记录")]
+
+
+def push_message(environment: Mapping[str, str], transport: HttpTransport, title: str, content: str) -> None:
+    token = environment.get("PUSHPLUS_TOKEN", "").strip()
+    if not token:
+        raise SafeError("PUSHPLUS_TOKEN 未配置，无法提交短信")
+    payload = {"token": token, "title": title, "content": content, "template": "txt", "channel": "cmcc"}
+    option = environment.get("PUSHPLUS_OPTION", "").strip()
+    if option:
+        payload["option"] = option
+    response = transport.post(PUSH_URL, {"content-type": "application/json; charset=utf-8"}, json.dumps(payload, ensure_ascii=False).encode())
+    if not is_int(response.get("code")) or response["code"] != 200:
+        raise SafeError("PushPlus 未接受通知，请检查 Token、渠道及额度")
+
+
+def mask_credentials(environment: Mapping[str, str]) -> None:
+    if environment.get("GITHUB_ACTIONS") != "true":
+        return
+    masks = set()
+    for name in ["PUSHPLUS_TOKEN"] + [f"HOPEGOO_ACCOUNT_{slot:02d}" for slot in range(1, 11)]:
+        raw = environment.get(name, "")
+        if not raw:
+            continue
+        masks.add(raw)
+        if name.startswith("HOPEGOO_ACCOUNT_"):
+            try:
+                account = json.loads(raw)
+                for field in ("query", "signin"):
+                    request = account.get(field, {})
+                    if isinstance(request.get("body"), str):
+                        masks.add(request["body"])
+                    for key, value in request.get("headers", {}).items():
+                        if key.lower() in ("hopegoo-token", "hopegoo-encryptkey", "cookie") and isinstance(value, str):
+                            masks.add(value)
+            except (ValueError, TypeError, AttributeError):
+                pass
+    for value in sorted(masks):
+        escaped = value.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+        print("::add-mask::" + escaped)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--mode", choices=("query", "checkin"), default="query")
+    parser.add_argument("--report", type=Path, default=Path("hopegoo-report.json"))
+    parser.add_argument("--notify", action="store_true", help="Send summary from report; create failure summary if missing")
+    args = parser.parse_args(argv)
+    mask_credentials(os.environ)
+    today = current_date()
+    transport = HttpTransport()
+    if args.notify:
+        results = read_report(args.report, today)
+        title, content = format_message(results, today)
+        print(title + "\n" + content)
+        try:
+            push_message(os.environ, transport, title, content)
+        except SafeError as error:
+            print(str(error), file=sys.stderr)
+            return 1
+        except Exception:
+            print("通知步骤执行异常", file=sys.stderr)
+            return 1
+        print("PushPlus 已接受通知请求；最终送达状态请在 PushPlus 查询。")
+        return 0
+    results = run_accounts(os.environ, transport, args.mode, today)
+    write_report(args.report, results, today, args.mode)
+    title, content = format_message(results, today)
+    print(title + "\n" + content)
+    return int(any(item.status in ("failed", "uncertain") for item in results))
+
+
+if __name__ == "__main__":
+    sys.exit(main())

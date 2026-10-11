@@ -1,0 +1,115 @@
+name: Hopegoo daily check-in
+
+on:
+  schedule:
+    # UTC 16:08 = 北京时间下一天 00:08。
+    - cron: '8 16 * * *'
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'query 只查询；checkin 查询后提交当天未完成的签到'
+        required: true
+        default: query
+        type: choice
+        options:
+          - query
+          - checkin
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hopegoo-checkin
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Offline validation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - name: Verify account and notification behavior
+        run: python -m unittest discover -s tests -v
+      - name: Verify local HAR importer
+        run: node tests/verify-importer.cjs
+
+  checkin:
+    name: Check in and send SMS
+    needs: validate
+    if: always() && github.event_name != 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      REPORT_PATH: ${{ runner.temp }}/hopegoo-report.json
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - name: Query or check in
+        if: needs.validate.result == 'success'
+        env:
+          RUN_MODE: ${{ github.event_name == 'schedule' && 'checkin' || inputs.mode || 'query' }}
+          HOPEGOO_ACCOUNT_01: ${{ secrets.HOPEGOO_ACCOUNT_01 }}
+          HOPEGOO_ACCOUNT_02: ${{ secrets.HOPEGOO_ACCOUNT_02 }}
+          HOPEGOO_ACCOUNT_03: ${{ secrets.HOPEGOO_ACCOUNT_03 }}
+          HOPEGOO_ACCOUNT_04: ${{ secrets.HOPEGOO_ACCOUNT_04 }}
+          HOPEGOO_ACCOUNT_05: ${{ secrets.HOPEGOO_ACCOUNT_05 }}
+          HOPEGOO_ACCOUNT_06: ${{ secrets.HOPEGOO_ACCOUNT_06 }}
+          HOPEGOO_ACCOUNT_07: ${{ secrets.HOPEGOO_ACCOUNT_07 }}
+          HOPEGOO_ACCOUNT_08: ${{ secrets.HOPEGOO_ACCOUNT_08 }}
+          HOPEGOO_ACCOUNT_09: ${{ secrets.HOPEGOO_ACCOUNT_09 }}
+          HOPEGOO_ACCOUNT_10: ${{ secrets.HOPEGOO_ACCOUNT_10 }}
+        run: python checkin.py --mode "$RUN_MODE" --report "$REPORT_PATH"
+      - name: Always submit cmcc SMS summary
+        if: always()
+        env:
+          PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
+          PUSHPLUS_OPTION: ${{ vars.PUSHPLUS_OPTION }}
+        shell: bash
+        run: |
+          if [ -f checkin.py ]; then
+            /usr/bin/python3 checkin.py --notify --report "$REPORT_PATH"
+          else
+            # Checkout failure: notification still runs without project files.
+            /usr/bin/python3 - <<'PY'
+          import datetime, json, os, sys, urllib.error, urllib.request
+          from zoneinfo import ZoneInfo
+          token = os.environ.get('PUSHPLUS_TOKEN', '').strip()
+          if not token:
+              sys.exit('PUSHPLUS_TOKEN 未配置，无法提交短信')
+          class NoRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, *args):
+                  return None
+          title = 'Hopegoo签到 ' + datetime.datetime.now(ZoneInfo('Asia/Shanghai')).strftime('%m/%d')
+          payload = {'token': token, 'title': title, 'content': '成功0｜已签0｜失败1\n01：失败，工作流启动失败，请查看运行记录', 'template': 'txt', 'channel': 'cmcc'}
+          option = os.environ.get('PUSHPLUS_OPTION', '').strip()
+          if option:
+              payload['option'] = option
+          request = urllib.request.Request('https://www.pushplus.plus/send', data=json.dumps(payload, ensure_ascii=False).encode(), headers={'Content-Type': 'application/json'}, method='POST')
+          try:
+              with urllib.request.build_opener(NoRedirect()).open(request, timeout=30) as response:
+                  result = json.load(response)
+              if type(result.get('code')) is not int or result['code'] != 200:
+                  sys.exit('PushPlus 未接受通知')
+          except (OSError, ValueError):
+              sys.exit('通知提交失败，请检查 PushPlus 配置及运行记录')
+          print('PushPlus 已接受失败摘要；最终送达状态请在 PushPlus 查询。')
+          PY
+          fi
+
+  keepalive:
+    name: Keep scheduled workflow active
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - name: Retain scheduled execution
+        # Verified v1 commit. This job receives no account or PushPlus secrets.
+        uses: liskin/gh-workflow-keepalive@f72ff1a1336129f29bf0166c0fd0ca6cf1bcb38c

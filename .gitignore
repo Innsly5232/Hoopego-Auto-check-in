@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.venv/
+.env
+.env.*
+*.har
+*secret*.json
+*account*.json
+hopegoo-report.json
+hopegoo-report.json.tmp
