@@ -67,6 +67,19 @@ check('wrong endpoint or domain is rejected', () => {
   rejects(har(QUERY_URL.replace('app.hopegoo.com', 'untrusted.invalid')));
   rejects(goodSignin(), goodQuery());
 });
+check('new capture domain is preserved in both request bundles', () => {
+  const query = har(QUERY_URL.replace('app.hopegoo.com', 'app.reshg.com'));
+  const signin = har(SIGNIN_URL.replace('app.hopegoo.com', 'app.reshg.com'));
+  const restored = JSON.parse(make(query, signin).payload);
+  assert.equal(restored.query.url, query.log.entries[0].request.url);
+  assert.equal(restored.signin.url, signin.log.entries[0].request.url);
+});
+check('mixed domains and cookie/token conflicts fail before serialization', () => {
+  rejects(har(QUERY_URL.replace('app.hopegoo.com', 'app.reshg.com')));
+  const query = goodQuery();
+  query.log.entries[0].request.headers.push({name: 'Cookie', value: 'cnUser=sectoken=different-session'});
+  rejects(query);
+});
 check('ambiguous multiple records are rejected', () => {
   const query = goodQuery();
   query.log.entries.push(query.log.entries[0]);

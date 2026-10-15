@@ -5,6 +5,15 @@ on:
     # UTC 16:08 = 北京时间下一天 00:08。
     - cron: '8 16 * * *'
   workflow_dispatch:
+    inputs:
+      mode:
+        description: 'query 只验证账号；checkin 查询后签到并发送汇总'
+        type: choice
+        options:
+          - checkin
+          - query
+        default: checkin
+        required: true
 
 permissions:
   contents: read
@@ -25,6 +34,7 @@ jobs:
           python-version: '3.13'
       - name: Online check-in and verify
         env:
+          HOPEGOO_MODE: ${{ github.event_name == 'schedule' && 'checkin' || inputs.mode || 'checkin' }}
           HOPEGOO_ACCOUNT_01: ${{ secrets.HOPEGOO_ACCOUNT_01 }}
           HOPEGOO_ACCOUNT_02: ${{ secrets.HOPEGOO_ACCOUNT_02 }}
           HOPEGOO_ACCOUNT_03: ${{ secrets.HOPEGOO_ACCOUNT_03 }}
@@ -35,9 +45,9 @@ jobs:
           HOPEGOO_ACCOUNT_08: ${{ secrets.HOPEGOO_ACCOUNT_08 }}
           HOPEGOO_ACCOUNT_09: ${{ secrets.HOPEGOO_ACCOUNT_09 }}
           HOPEGOO_ACCOUNT_10: ${{ secrets.HOPEGOO_ACCOUNT_10 }}
-        run: python checkin.py --mode checkin --report "$RUNNER_TEMP/hopegoo-report.json"
+        run: python checkin.py --mode "$HOPEGOO_MODE" --skip-signed --report "$RUNNER_TEMP/hopegoo-report.json"
       - name: Always submit cmcc SMS summary
-        if: always()
+        if: always() && (github.event_name == 'schedule' || inputs.mode == 'checkin')
         env:
           PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
           PUSHPLUS_OPTION: ${{ vars.PUSHPLUS_OPTION }}

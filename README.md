@@ -1,138 +1,88 @@
 # Hopegoo 自动签到
 
-使用本人账号在 iPhone Reqable 捕获的请求，由 GitHub Actions 每天北京时间 **00:08** 查询并签到。先验证 1 个账号，确认跨日可用后可配置至 10 个。每次签到运行结束都向 PushPlus **cmcc** 提交一份短信汇总，包括成功、已签到、部分失败和全部失败。
+使用本人账号正常操作时捕获的完整请求进行查询与签到。Python 脚本只依赖标准库。
 
-当前已确认 App 正常签到接口、Mac 同日查询重发及同日云端查询成功。**签到提交请求的云端执行、跨日复用和长期有效期需要通过实际运行确认。**初版原样使用捕获的编码请求体及配套请求头；过期时需要重新抓包并更新 Secret。项目不处理邮箱验证码或自动重新登录。
+每天 **北京时间 00:08**（UTC `8 16 * * *`）运行：先查询当天状态；已经签到则跳过；未签到时提交一次，再查询确认。支持最多 10 个独立账号。定时签到和手动 `checkin` 模式通过 PushPlus **cmcc** 提交一份汇总。
 
-## 一次性配置：今天完成
+手动排查也可使用 [独立手动脚本](MANUAL.md)，直接读取 HAR，默认离线检查，无需 GitHub Secrets 或通知配置。
 
-### 1. 准备同一账号的两个 HAR
+## 账号配置
 
-你已保存的文件可以直接使用：
+为同一账号、同一次登录会话导出两条完整 HAR 请求，保留原始请求体：
 
-- `hopegoo-query.har`：仅包含 `POST https://app.hopegoo.com/sea_shell/manta-you/memberCheckin/listCheckin`。
-- `hopegoo-signin.har`：仅包含 `POST https://app.hopegoo.com/sea_shell/manta-you/memberCheckin/performCheckin`。
+- 查询：`/sea_shell/manta-you/memberCheckin/listCheckin`
+- 签到：`/sea_shell/manta-you/memberCheckin/performCheckin`
 
-需要重新导出时，在 Mac Reqable 对对应记录右键 → **导出 → HAR**。从同一个账号、同一次登录会话中各选一条记录；不要仅导出响应体。两个文件都含登录资料，只保存在本机，不提交到仓库或贴到聊天。
+已支持 `app.hopegoo.com` 和新抓包使用的 `app.reshg.com`。脚本保留真实域名；查询和签到须来自同一域名，Token 须一致，Cookie 中的会话值也须与 Token 匹配。两份 HAR 可以保留原文件名。
 
-### 2. 下载本地导入工具
+使用本地 [HAR 导入工具](tools/hopegoo-secret-importer.html)：下载 HTML 后在浏览器打开，选择账号编号和两个 HAR，点击“校验并生成配置”，再复制账号配置。页面只在本机处理文件，禁止网络访问，不保存浏览器持久数据。
 
-打开 [导入工具文件](https://github.com/Innsly5232/Hoopego-Auto-check-in/blob/main/tools/hopegoo-secret-importer.html)，点击文件页面的 **Download raw file** 按钮，下载 HTML 到 Mac。用 Chrome 或 Safari 打开下载的 HTML 文件。若下载功能找不到，也可用聊天中提供的本地文件下载链接。
+在 GitHub 仓库的 **Settings → Secrets and variables → Actions** 中保存为：
 
-1. 账号编号选 **账号 01**。
-2. “查询文件”选择 `hopegoo-query.har`。
-3. “签到文件”选择 `hopegoo-signin.har`。
-4. 点击 **校验并生成配置**。
-5. 显示校验通过后，点击 **复制账号配置**。
+| 名称 | 内容 |
+| --- | --- |
+| `HOPEGOO_ACCOUNT_01` | 导入工具生成的账号 01 完整配置 |
+| `HOPEGOO_ACCOUNT_02` 至 `HOPEGOO_ACCOUNT_10` | 其他账号各自的配对配置，可选 |
+| `PUSHPLUS_TOKEN` | 用于接收 cmcc 汇总的 PushPlus Token |
 
-页面只在本机浏览器读取文件，内容安全策略禁止网络连接，无外部资源或浏览器持久存储；它不会验证在线签到。复制内容含会话资料，请仅粘贴到下面的 GitHub Secret 表单。
+空账号槽位会被跳过；格式错误的账号会独立报告失败，不阻止其他账号。新增账号应捕获自己的查询和签到请求，不能只把旧账号请求中的 Token 替换成新账号 Token。
 
-### 3. 添加账号 Secret
+`PUSHPLUS_OPTION` 为可选的仓库 Variable；使用原 PushPlus 配置需要该项时再填写。cmcc 已固定，不需要配置 `PUSHPLUS_CHANNEL`。
 
-打开 [New repository secret](https://github.com/Innsly5232/Hoopego-Auto-check-in/settings/secrets/actions/new)，登录你有权管理这个仓库的 GitHub 账号。
+账号配置、HAR、Token、Cookie、加密头和编码请求体都属于私有会话资料，只放在本机私有位置或 GitHub Secrets。不要提交到仓库，也不要写入脚本源码。GitHub 不提供 Secret 明文读取；查看代码或成功推送不能证明账号 Secret 已更新。
 
-| 表单项目 | 填写内容 |
-|---|---|
-| Name | `HOPEGOO_ACCOUNT_01` |
-| Secret | 粘贴导入工具刚复制的完整配置 |
+## 首次配置与排查
 
-点击 **Add secret**。保存后不会再显示 Secret 明文，这是正常的。不要上传 HAR 到 GitHub 的文件页面，也不要把配置放在普通 Variables。
+进入 **Actions → Hopegoo daily check-in → Run workflow**：
 
-### 4. 添加 PushPlus Secret
+1. 首先选择 `query`。它只查询所有已配置账号，不提交签到、不发送短信。
+2. 确认日志显示当天日期和预期签到状态，Summary 无失败。
+3. 需要运行完整流程时选择 `checkin`。前查已签则跳过提交，否则提交一次后查询，并尝试发送汇总。
+4. 账号及通知配置确认后，再保持工作流为启用状态，供每天北京时间 00:08 的计划任务触发。GitHub Actions 可能排队延迟。
 
-再次打开 [New repository secret](https://github.com/Innsly5232/Hoopego-Auto-check-in/settings/secrets/actions/new)。
+手动启动默认使用 `checkin`；定时事件固定使用 `checkin`。`query` 是首次配置或排障时的可选模式。正常运行直接使用 GitHub 注入的 Secret，不重复调用 GitHub API 检查账号、权限或 Secret 配置；签到前的业务查询用于判断当天是否已签。
 
-| 表单项目 | 填写内容 |
-|---|---|
-| Name | `PUSHPLUS_TOKEN` |
-| Secret | 你现在使用的 PushPlus Token |
+运行状态以实际 GitHub 页面为准，修改或发布 Codex 云环境配置不会自动更新仓库 Secret，也不会自动启用 GitHub 工作流。
 
-点击 **Add secret**。Token 可从你已有的安全保存位置或 [PushPlus 官网](https://www.pushplus.plus/) 登录后查看。GitHub 无法读取原仓库 Secret 的明文，需重新安全填入新仓库。继续使用原来可发送 cmcc 的 PushPlus 账号及设置。
+## 结果判定
 
-在 [Secrets 列表](https://github.com/Innsly5232/Hoopego-Auto-check-in/settings/secrets/actions) 确认存在这两个名称即可，不需要展示值。
+- 查询必须返回 HTTP 200、业务 `status=200`，并包含与北京时间当天一致的有效日历。
+- 签到业务 `status=200` 表示接口接受，仍需后查确认今天已签。
+- **签到业务 `status=80002` 按已签到处理**，来源为用户已完成的重复签到实测；仍需后查确认今天已签。它不用于放行查询接口，也不计为新增奖励。
+- 其他业务码按真实状态报告，不直接解释为 Token 过期。
+- 提交超时或响应不完整时不重试签到，仍尝试后查；即使后查已签，也保留“提交响应未确认”。
+- `80002` 后查失败或仍未签到，不会被标记为成功。
 
-cmcc 已固定在脚本里，**不需要填写 `PUSHPLUS_CHANNEL`**。如果原项目使用了 `PUSHPLUS_OPTION`，在 [原项目 Variables](https://github.com/Innsly5232/Glados-Railgun-checkin/settings/variables/actions) 查看该项，将相同值填入 [新项目 Variables](https://github.com/Innsly5232/Hoopego-Auto-check-in/settings/variables/actions)，Name 为 `PUSHPLUS_OPTION`；原项目没有这项则跳过。
+前查已签的账号会汇总为“今日已签到，连续 N 天”。奖励未知时明确标记未知。重复提交及已签到结果均不虚构新增 G-coins。
 
-## 今天验证云端签到和短信
+签到和通知分别报告：PushPlus 接受通知请求只表示通知已提交，最终短信送达以手机和 PushPlus 记录为准。工作流使用 `always()` 尝试提交 `checkin` 失败摘要；工作流本身无法解析时，GitHub 无法启动通知步骤。
 
-1. 打开 [Hopegoo daily check-in 工作流](https://github.com/Innsly5232/Hoopego-Auto-check-in/actions/workflows/hopegoo-checkin.yml)。
-2. 如果 GitHub 提示 Actions 未启用，点击允许启用。若工作流被禁用，先点击 **Enable workflow**。
-3. 点击右侧 **Run workflow**。
-4. Branch 选 `main`，点击绿色 **Run workflow**。没有模式下拉选择。
-5. 等待出现新运行记录，点击进入。
-6. 查看 **Online Hopegoo check-in and SMS** 中的 **Online check-in and verify** 和 **Always submit cmcc SMS summary**。
+## 日期与有效期
 
-手动运行与每天北京时间 00:08 的定时运行完全相同：先查询核对当天日期，再对每个已配置账号提交一次 `performCheckin`，当天已经签到也提交，最后再次查询。GitHub 的“手动运行”只指点一次按钮启动云端任务，无需自己在 Reqable 重发请求。
+程序按 `Asia/Shanghai` 读取当天日期，没有固定业务日期。测试中的固定日期仅用于模拟。
 
-运行页面的 Summary 会显示账号结果及本次签到提交的 HTTP、业务 status，以及短信提交结果。日志出现“签到提交接口通过（HTTP 200，业务 status=200）”说明提交接口接受了请求；还需最终查询确认当天已签。原本已签时，正常摘要为“今日已签到，连续 N 天，重复提交已接受”，不把再次返回的 `coins` 算成新增奖励。
+编码请求体与配套加密头原样重放，不会擅自修改其中可能存在的日期、时间戳或签名。抓包当天查询成功及重复提交返回 `80002`，不能单独证明同一套资料可以跨日签到或永久有效。应在次日未签到时，用同一份资料完成查询、单次提交及后查，验证跨日可用性。过期时重新捕获并更新对应账号 Secret；脚本不自动重新登录。
 
-若接口返回失败，即使最终查询仍显示当天已签，本次运行也明确报告失败；不会用已有签到状态掩盖提交失败。未知的业务 status 按真实状态码报告，不直接判定 Token 过期，也不套用 Glados 的重复签到结果码。提交超时或响应无法解析时显示“提交响应未确认”，即使查询确认当天已签，也不能据此宣称原签到请求已被接受。后置查询失败保留脱敏原因。
+日历查询只能验证接口接受当前会话，不足以证明它属于某个预期手机号或用户 ID；账号归属需要另外的、实际含账号标识的只读资料。
 
-超时或拒绝不会自动重发第二次。使用同一份 Secret 到次日，查询返回新一天的日期、提交接口接受请求、后查确认已签，才能确认整套资料该次跨日可用。只查询成功不能证明签到请求体和加密参数也跨日可用；一次跨日通过也不代表会话永久有效。
+## 本地开发与排查
 
-签到与短信分别排查：“PushPlus 已接受通知请求”不等于短信已实际送达，最终结果可在 PushPlus 查询并以手机收到的消息为准。
-
-独立的 [Hopegoo code checks 工作流](https://github.com/Innsly5232/Hoopego-Auto-check-in/actions/workflows/hopegoo-ci.yml) 只在代码提交或 PR 时检查所有工作流、Python 行为及 HAR 导入器，使用模拟数据且不传入账号 Secrets。它显示绿色只能证明代码检查通过。日常签到不重复执行这些检查。
-
-可以将结果摘要或步骤状态截图发给协助者，不要发送 Secret、请求头、HAR、Token 或编码请求体。
-
-## 明天及以后
-
-定时 cron 为 UTC `8 16 * * *`，对应北京时间每日 **00:08**。GitHub Actions 可能排队延迟。任务在 GitHub 上运行，Mac 和 iPhone 均无需保持在线。
-
-手动运行的短信步骤若跨过北京时间午夜，仍汇总该次签到报告并使用报告日期；不同任务或重新运行不会复用旧报告。
-
-每个账号先查询，只有当天日历日期正确、业务状态正常时才提交一次签到，再查询确认 `todayStatus=1`。当天已经签到也提交一次并记录重复提交结果。奖励无法确定时写“奖励未知”，原本已签时不计新增奖励。各账号独立处理，一个失败不阻止其他账号。
-
-通知步骤使用 `always()`：运行启动后，签到脚本或 checkout 等步骤失败时生成失败摘要并尝试提交短信。工作流配置无法解析时，GitHub 不会启动任何步骤，也无法发送短信。独立代码校验中的 actionlint 用于提前发现此类配置错误。未配置 `PUSHPLUS_TOKEN`、通知服务拒绝请求等情况会在运行记录明确报错。保活任务仅在公开仓库的定时运行时执行；当前私有仓库跳过，账号和通知密钥不交给该步骤。
-
-在收到跨日结果后再判断初版是否可用。登录会话或编码请求过期时，重新登录、正常操作捕获新的同账号查询和签到 HAR，再用导入工具更新该账号 Secret。短信会提示脱敏错误，不会暴露会话值。
-
-## 已确认的短信格式
-
-成功示例：
-
-```text
-Hopegoo签到 10/12
-成功1｜已签0｜失败0
-01：成功，+5 G-coins，连续2天
-```
-
-已经签到示例：
-
-```text
-Hopegoo签到 10/12
-成功0｜已签1｜失败0
-01：今日已签到，连续2天，重复提交已接受
-```
-
-失败示例：
-
-```text
-Hopegoo签到 10/12
-成功0｜已签0｜失败1
-01：失败，请求超时
-```
-
-奖励和天数使用实际核实结果，无法确认时显示未知。无法核实的结果计入失败并注明原因；账号已签但本次提交返回失败时，也计入失败并注明“当天已签到”。扩容后每个账号占一行，一次向 PushPlus 提交全部已配置账号的汇总。
-
-## 扩至 10 个账号
-
-对每个账号捕获各自的两个 HAR，用工具选择对应编号，分别添加 `HOPEGOO_ACCOUNT_02` 至 `HOPEGOO_ACCOUNT_10`。单个 Secret 包含该账号的完整配对请求，不能与其他账号混用。空编号不会被执行；已有 Secret 格式错误会作为该账号失败报告。无需修改工作流。
-
-## 本地开发
-
-Python 3.10+，Node 18+ 用于导入工具检查。运行脚本只使用 Python 标准库，无需安装 pip 包。
+Python 3.10+；Node 18+ 用于导入器检查。GitHub Actions 使用 Python 3.13。无需安装 pip/npm 依赖。
 
 ```bash
 python -m unittest discover -s tests -v
 node tests/verify-importer.cjs
+bash tools/validate-workflow.sh
 ```
 
-这些检查使用模拟会话和本地 HTTP 服务，不验证真实账号或短信送达。工作流运行时用 Python 3.13。
+工作流校验需要 Linux amd64，会下载固定版本的 actionlint 并验证 SHA-256。测试使用虚构资料及本地 HTTP 服务，不读取真实账号 Secret。
 
-完整离线模拟覆盖 10 个账号从 HTTP 查询、提交、后查到报告和单次 cmcc 汇总，包括已签重复提交及单账号认证失败。响应截断（gzip、Content-Length、chunked）时仍执行后查，保留“响应未确认”状态且不重试签到；也检查跨午夜报告、防止旧任务结果复用及解压后的响应大小限制。
+已有完整账号配置注入环境时：
 
-独立代码校验运行固定版本、SHA-256 校验后的 actionlint，检查所有 GitHub Actions 文件的语法和表达式上下文。在 Linux amd64 上可运行 `bash tools/validate-workflow.sh`；它需要联网下载校验工具，但不会读取账号 Secrets。
+```bash
+python checkin.py --mode query --report /private/path/hopegoo-report.json
+python checkin.py --mode checkin --skip-signed --report /private/path/hopegoo-report.json
+python checkin.py --notify --report /private/path/hopegoo-report.json
+```
 
-本地 CLI 默认只查询：`python checkin.py --mode query --report hopegoo-report.json`，保留用于开发排障。签到需显式使用 `--mode checkin`，当天已签也会提交一次。GitHub 日常工作流固定使用 `checkin`，没有模式选择。通知为独立命令：`python checkin.py --notify --report hopegoo-report.json`。账号配置从环境变量读取；不要将真实值写进命令行、仓库文件或测试。
+省略 `--skip-signed` 的 `checkin` 模式可用于有意重放一次已签请求的排查。正常自动工作流带有该参数。每个账号最多提交一次；短信为独立命令。报告只保存脱敏结果，并核对 GitHub run/attempt 身份，避免复用旧任务报告；同一次任务跨午夜发送汇总时保留原报告日期。

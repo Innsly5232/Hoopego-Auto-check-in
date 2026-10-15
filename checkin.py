@@ -20,6 +20,7 @@ from datetime import date, datetime, timedelta
 from typing import Any, Mapping
 import urllib.error
 import urllib.request
+from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 import zlib
 
@@ -27,6 +28,9 @@ import zlib
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 QUERY_URL = "https://app.hopegoo.com/sea_shell/manta-you/memberCheckin/listCheckin"
 SIGNIN_URL = "https://app.hopegoo.com/sea_shell/manta-you/memberCheckin/performCheckin"
+ALLOWED_HOSTS = {"app.hopegoo.com", "app.reshg.com"}
+ALLOWED_PATHS = {urlsplit(QUERY_URL).path, urlsplit(SIGNIN_URL).path}
+ALREADY_SIGNED_CODE = 80002
 PUSH_URL = "https://www.pushplus.plus/send"
 MAX_RESPONSE_BYTES = 1024 * 1024
 MAX_SECRET_BYTES = 48 * 1024
@@ -53,6 +57,32 @@ def current_date() -> date:
     return datetime.now(SHANGHAI).date()
 
 
+def supported_url(url: str, expected_url: str | None = None) -> bool:
+    if not isinstance(url, str):
+        return False
+    try:
+        parsed = urlsplit(url)
+        return (parsed.scheme == "https" and parsed.netloc.lower() in ALLOWED_HOSTS
+                and parsed.path in ALLOWED_PATHS and not parsed.query and not parsed.fragment
+                and (expected_url is None or parsed.path == urlsplit(expected_url).path))
+    except ValueError:
+        return False
+
+
+def cookie_consistency(headers: Mapping[str, str]) -> str:
+    token = headers["hopegoo-token"].encode("utf-8")
+    values = []
+    for item in headers.get("cookie", "").split(";"):
+        name, separator, value = item.strip().partition("=")
+        if separator and name == "sectoken":
+            values.append(value)
+        elif separator and name == "cnUser" and value.startswith("sectoken="):
+            values.append(value[len("sectoken="):])
+    if any(not hmac.compare_digest(token, value.encode("utf-8")) for value in values):
+        raise SafeError("Token 与 Cookie 中的 sectoken 不一致")
+    return "matched" if values else "not_available"
+
+
 @dataclass(frozen=True)
 class CapturedRequest:
     url: str
@@ -61,7 +91,8 @@ class CapturedRequest:
 
     @classmethod
     def from_config(cls, config: Any, expected_url: str) -> CapturedRequest:
-        if not isinstance(config, dict) or config.get("url") != expected_url or config.get("method") != "POST":
+        if (not isinstance(config, dict) or not supported_url(config.get("url"), expected_url)
+                or config.get("method") != "POST"):
             raise SafeError("请求配置不匹配")
         raw_headers = config.get("headers")
         body = config.get("body")
@@ -85,7 +116,8 @@ class CapturedRequest:
             raise SafeError("登录或加密配置缺失")
         if headers.get("content-encoding", "identity").lower() != "identity":
             raise SafeError("请求体编码需重新核对")
-        return cls(expected_url, headers, body.encode("utf-8"))
+        cookie_consistency(headers)
+        return cls(config["url"], headers, body.encode("utf-8"))
 
 
 @dataclass(frozen=True)
@@ -106,6 +138,8 @@ class Account:
             raise SafeError("账号配置版本不支持")
         query = CapturedRequest.from_config(value.get("query"), QUERY_URL)
         signin = CapturedRequest.from_config(value.get("signin"), SIGNIN_URL)
+        if urlsplit(query.url).netloc.lower() != urlsplit(signin.url).netloc.lower():
+            raise SafeError("查询与签到请求来自不同域名")
         if not hmac.compare_digest(query.headers["hopegoo-token"].encode(), signin.headers["hopegoo-token"].encode()):
             raise SafeError("两个请求的登录会话不一致")
         return cls(f"{slot:02d}", query, signin)
@@ -229,14 +263,15 @@ def query_account(account: Account, transport: HttpTransport, today: date) -> Ca
     return calendar_state(transport.post(request.url, request.headers, request.body), today)
 
 
-def check_account(account: Account, transport: HttpTransport, mode: str, today: date) -> Result:
+def check_account(account: Account, transport: HttpTransport, mode: str, today: date,
+                  skip_signed: bool = False) -> Result:
     try:
         before = query_account(account, transport, today)
     except SafeError as error:
         return Result(account.label, "failed", reason=str(error))
+    if before.signed and (mode == "query" or skip_signed):
+        return Result(account.label, "already", days=before.days)
     if mode == "query":
-        if before.signed:
-            return Result(account.label, "already", days=before.days)
         return Result(account.label, "query_only", days=before.days)
 
     coins = None
@@ -251,11 +286,16 @@ def check_account(account: Account, transport: HttpTransport, mode: str, today: 
         code = response.get("status")
         if is_int(code) and 0 <= code <= 1000000:
             submission_code = code
-        body = business_body(response)
-        reward = body.get("coins")
-        if is_int(reward) and 0 <= reward <= 1000000:
-            coins = reward
-        submission_status = "accepted"
+        if submission_code == ALREADY_SIGNED_CODE:
+            # Confirmed by the user's live duplicate-submission validation.
+            # This does not imply a new reward or replace the post-query.
+            submission_status = "already"
+        else:
+            body = business_body(response)
+            reward = body.get("coins")
+            if is_int(reward) and 0 <= reward <= 1000000:
+                coins = reward
+            submission_status = "accepted"
     except SafeError as error:
         submission_error = str(error)
         submission_http = error.http_status or submission_http
@@ -274,6 +314,9 @@ def check_account(account: Account, transport: HttpTransport, mode: str, today: 
     except SafeError as error:
         return Result(account.label, "uncertain", reason="提交后查询未通过，" + str(error), **submission)
     if after.signed:
+        if submission_status == "already":
+            return Result(account.label, "already", days=after.days,
+                          reason="接口返回已签到", **submission)
         if submission_status == "rejected":
             return Result(account.label, "failed", days=after.days, reason="当天已签到，提交接口返回失败，" + submission_error, **submission)
         if submission_status == "unknown":
@@ -285,7 +328,8 @@ def check_account(account: Account, transport: HttpTransport, mode: str, today: 
     return Result(account.label, "failed", days=after.days, reason=submission_error or "提交后仍未签到", **submission)
 
 
-def run_accounts(environment: Mapping[str, str], transport: HttpTransport, mode: str, today: date) -> list[Result]:
+def run_accounts(environment: Mapping[str, str], transport: HttpTransport, mode: str, today: date,
+                 skip_signed: bool = False) -> list[Result]:
     results = []
     for slot in range(1, 11):
         raw = environment.get(f"HOPEGOO_ACCOUNT_{slot:02d}", "")
@@ -293,7 +337,7 @@ def run_accounts(environment: Mapping[str, str], transport: HttpTransport, mode:
             continue
         try:
             account = Account.from_secret(raw, slot)
-            results.append(check_account(account, transport, mode, today))
+            results.append(check_account(account, transport, mode, today, skip_signed))
         except SafeError as error:
             results.append(Result(f"{slot:02d}", "failed", reason=str(error)))
         except Exception:
@@ -377,7 +421,7 @@ def load_report(path: Path, today: date) -> tuple[date, list[Result]]:
                 raise ValueError()
             if not isinstance(result.reason, str) or len(result.reason) > 100:
                 raise ValueError()
-            if result.submission_status not in ("not_sent", "accepted", "rejected", "unknown"):
+            if result.submission_status not in ("not_sent", "accepted", "already", "rejected", "unknown"):
                 raise ValueError()
             if result.submission_http is not None and (not is_int(result.submission_http) or not 100 <= result.submission_http <= 599):
                 raise ValueError()
@@ -423,7 +467,7 @@ def summarize_results(results: list[Result], today: date) -> None:
     lines = [f"### {title}", "", "```text", content, "```", "",
              "| 账号 | 本次签到提交 | HTTP | 业务 status |",
              "| --- | --- | --- | --- |"]
-    labels = {"not_sent": "未提交", "accepted": "接口已接受", "rejected": "接口返回失败", "unknown": "响应未确认"}
+    labels = {"not_sent": "未提交", "accepted": "接口已接受", "already": "接口返回已签到", "rejected": "接口返回失败", "unknown": "响应未确认"}
     for item in results:
         http = "未知" if item.submission_http is None else str(item.submission_http)
         code = "未知" if item.submission_code is None else str(item.submission_code)
@@ -460,6 +504,7 @@ def mask_credentials(environment: Mapping[str, str]) -> None:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mode", choices=("query", "checkin"), default="query")
+    parser.add_argument("--skip-signed", action="store_true", help="前查确认当天已签时跳过提交")
     parser.add_argument("--report", type=Path, default=Path("hopegoo-report.json"))
     parser.add_argument("--notify", action="store_true", help="Send summary from report; create failure summary if missing")
     args = parser.parse_args(argv)
@@ -485,22 +530,28 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     descriptions = {
         "query": "联网查询，不提交签到",
-        "checkin": "联网签到，当天已签也提交一次，随后查询确认",
+        "checkin": ("联网签到，前查已签则跳过，提交后查询确认" if args.skip_signed
+                    else "联网签到，当天已签也提交一次，随后查询确认"),
     }
     print(f"运行模式：{args.mode}（{descriptions[args.mode]}）")
     print(f"运行日期（北京时间）：{today.isoformat()}")
-    results = run_accounts(os.environ, transport, args.mode, today)
+    results = run_accounts(os.environ, transport, args.mode, today, args.skip_signed)
     write_report(args.report, results, today, args.mode)
     summarize_results(results, today)
     for item in results:
         if item.submission_status == "accepted":
             print(f"{item.label}：签到提交接口通过（HTTP 200，业务 status={item.submission_code}）")
+        elif item.submission_status == "already":
+            print(f"{item.label}：接口返回已签到（HTTP 200，业务 status={item.submission_code}）")
         elif item.submission_status in ("rejected", "unknown"):
             http = f"HTTP {item.submission_http}，" if item.submission_http is not None else ""
             detail = "签到提交接口返回失败" if item.submission_status == "rejected" else "签到提交响应未确认"
             print(f"{item.label}：{detail}（{http}{item.submission_reason}）")
         elif args.mode == "checkin":
-            print(f"{item.label}：未提交签到请求，前置查询或账号配置未通过")
+            if item.status == "already":
+                print(f"{item.label}：前查确认今日已签到，跳过提交")
+            else:
+                print(f"{item.label}：未提交签到请求，前置查询或账号配置未通过")
     title, content = format_message(results, today)
     print(title + "\n" + content)
     return int(any(item.status in ("failed", "uncertain") for item in results))

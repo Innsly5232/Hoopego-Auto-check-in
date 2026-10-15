@@ -73,6 +73,61 @@ class CheckinTests(unittest.TestCase):
             with self.assertRaises(checkin.SafeError):
                 checkin.Account.from_secret(json.dumps(value), 1)
 
+    def test_new_domain_preserves_both_actual_urls(self):
+        value = json.loads(secret())
+        for kind in ("query", "signin"):
+            value[kind]["url"] = value[kind]["url"].replace("app.hopegoo.com", "app.reshg.com")
+        account = checkin.Account.from_secret(json.dumps(value), 1)
+        self.assertEqual(account.query.url, value["query"]["url"])
+        self.assertEqual(account.signin.url, value["signin"]["url"])
+
+    def test_new_secret_cannot_mix_domains_or_conflicting_cookie(self):
+        value = json.loads(secret())
+        value["query"]["url"] = value["query"]["url"].replace("app.hopegoo.com", "app.reshg.com")
+        with self.assertRaisesRegex(checkin.SafeError, "不同域名"):
+            checkin.Account.from_secret(json.dumps(value), 1)
+        value = json.loads(secret())
+        value["query"]["headers"]["cookie"] = "sectoken=different-session"
+        with self.assertRaisesRegex(checkin.SafeError, "sectoken 不一致"):
+            checkin.Account.from_secret(json.dumps(value), 1)
+
+    def test_scheduled_skip_signed_uses_only_one_query(self):
+        transport = FakeTransport(calendar(True, 2))
+        result = checkin.check_account(self.account, transport, "checkin", TODAY, skip_signed=True)
+        self.assertEqual((result.status, result.submission_status), ("already", "not_sent"))
+        self.assertEqual([url for url, _, _ in transport.calls], [checkin.QUERY_URL])
+
+    def test_duplicate_code_requires_signed_postquery_and_never_counts_reward(self):
+        transport = FakeTransport(calendar(False, 1),
+                                  {"status": 80002, "body": {"coins": 999}}, calendar(True, 2))
+        result = checkin.check_account(self.account, transport, "checkin", TODAY)
+        self.assertEqual((result.status, result.submission_status, result.submission_code),
+                         ("already", "already", 80002))
+        self.assertIsNone(result.coins)
+        self.assertIn("接口返回已签到", result.reason)
+        for after in (calendar(False, 1), checkin.SafeError("网络连接失败")):
+            with self.subTest(after=type(after).__name__):
+                transport = FakeTransport(calendar(False, 1), {"status": 80002}, after)
+                result = checkin.check_account(self.account, transport, "checkin", TODAY)
+                self.assertIn(result.status, ("failed", "uncertain"))
+
+    def test_duplicate_result_report_roundtrip_and_summary(self):
+        result = checkin.Result("01", "already", days=2, submission_status="already",
+                               submission_http=200, submission_code=80002, reason="接口返回已签到")
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict("os.environ", {}, clear=True):
+            path = Path(directory) / "report.json"
+            checkin.write_report(path, [result], TODAY, "checkin")
+            self.assertEqual(checkin.read_report(path, TODAY), [result])
+        _, content = checkin.format_message([result], TODAY)
+        self.assertIn("已签1｜失败0", content)
+        self.assertNotIn("G-coins", content)
+
+    def test_duplicate_code_is_not_accepted_for_query(self):
+        transport = FakeTransport({"status": 80002})
+        result = checkin.check_account(self.account, transport, "checkin", TODAY)
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(len(transport.calls), 1)
+
     def test_header_injection_and_compressed_body_are_rejected(self):
         for key, value in [("cookie", "fake\r\nInjected: true"), ("content-encoding", "gzip")]:
             config = json.loads(secret())
