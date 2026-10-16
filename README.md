@@ -8,6 +8,8 @@
 
 ## 账号配置
 
+初次抓包可先阅读 [Reqable 抓包与 HAR 导出指引（PDF，10 页）](docs/Reqable_Hopegoo_Guide.pdf)，按步骤完成 iPhone 与 Mac 连接、证书安装、Hopegoo 请求抓取和 HAR 导出。需要保存到本机时可使用 [PDF 直接下载链接](https://github.com/Innsly5232/Hoopego-Auto-check-in/raw/refs/heads/main/docs/Reqable_Hopegoo_Guide.pdf)。
+
 为同一账号、同一次登录会话导出两条完整 HAR 请求，保留原始请求体：
 
 - 查询：`/sea_shell/manta-you/memberCheckin/listCheckin`
