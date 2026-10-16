@@ -1,5 +1,5 @@
 import contextlib
-from datetime import date
+from datetime import date, timedelta
 import gzip
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import io
@@ -264,7 +264,36 @@ class CheckinTests(unittest.TestCase):
         result = checkin.check_account(self.account, transport, "checkin", TODAY)
         self.assertEqual((result.status, result.coins, result.days), ("success", 5, 2))
         self.assertEqual([item[0] for item in transport.calls], [checkin.QUERY_URL, checkin.SIGNIN_URL, checkin.QUERY_URL])
-        self.assertEqual(transport.calls[1][2], self.account.signin.body)
+        self.assertEqual(json.loads(transport.calls[1][2]), {"date": TODAY.isoformat()})
+
+    def test_same_old_capture_generates_each_days_date_without_old_encryption_headers(self):
+        self.account.signin.headers["traceparent"] = "dummy-captured-trace"
+        original_headers = dict(self.account.signin.headers)
+        original_body = self.account.signin.body
+        for today in (TODAY, TODAY + timedelta(days=1)):
+            with self.subTest(today=today):
+                transport = FakeTransport(calendar(False, 1, today), {"status": 200, "body": {"coins": 5}},
+                                          calendar(True, 2, today))
+                result = checkin.check_account(self.account, transport, "checkin", today, skip_signed=True)
+                self.assertEqual(result.status, "success")
+                url, headers, body = transport.calls[1]
+                self.assertEqual(url, self.account.signin.url)
+                self.assertEqual(json.loads(body), {"date": today.isoformat()})
+                for key in ("hopegoo-token", "cookie"):
+                    self.assertEqual(headers[key], original_headers[key])
+                for key in ("hopegoo-encryptkey", "traceparent", "content-length"):
+                    self.assertNotIn(key, headers)
+                self.assertEqual(headers["content-type"], "application/json; charset=utf-8")
+                self.assertEqual(self.account.signin.headers, original_headers)
+                self.assertEqual(self.account.signin.body, original_body)
+                self.assertEqual(transport.calls[0][2], self.account.query.body)
+
+    def test_date_rejection_is_not_treated_as_success_or_retried(self):
+        transport = FakeTransport(calendar(False, 1), {"status": 80001, "body": None}, calendar(False, 1))
+        result = checkin.check_account(self.account, transport, "checkin", TODAY, skip_signed=True)
+        self.assertEqual((result.status, result.submission_status, result.submission_code),
+                         ("failed", "rejected", 80001))
+        self.assertEqual(sum(url == checkin.SIGNIN_URL for url, _, _ in transport.calls), 1)
 
     def test_old_calendar_cannot_trigger_new_day_submission(self):
         for mode in ("query", "checkin"):
@@ -631,7 +660,7 @@ class TransportTests(unittest.TestCase):
                 self.assertIsNone(result.coins)
                 self.assertIn("当天已签到，提交响应未确认", result.reason)
                 self.assertEqual(calls, [checkin.QUERY_URL, checkin.SIGNIN_URL, checkin.QUERY_URL])
-                self.assertEqual(self.seen[before:], [(path, b"opaque-signin++==")])
+                self.assertEqual(self.seen[before:], [(path, b'{"date":"2026-10-12"}')])
 
     def test_compressed_response_cannot_exceed_expanded_limit(self):
         with self.assertRaises(checkin.SafeError) as raised:

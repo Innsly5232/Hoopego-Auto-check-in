@@ -92,11 +92,25 @@ class OfflineEndToEndTests(unittest.TestCase):
                 records.append((slot, self.path))
                 kind = "query" if self.path == query_path else "signin"
                 expected = bundles[slot][kind]
-                if raw != expected["body"].encode("utf-8"):
-                    handler_errors.append(f"Account {slot:02d} opaque body changed")
-                for key in ("hopegoo-token", "hopegoo-encryptkey", "cookie"):
+                if kind == "query" and raw != expected["body"].encode("utf-8"):
+                    handler_errors.append(f"Account {slot:02d} query body changed")
+                for key in ("hopegoo-token", "cookie"):
                     if self.headers.get(key) != expected["headers"][key]:
                         handler_errors.append(f"Account {slot:02d} paired header changed")
+                if kind == "query":
+                    if self.headers.get("hopegoo-encryptkey") != expected["headers"]["hopegoo-encryptkey"]:
+                        handler_errors.append(f"Account {slot:02d} query encryption header changed")
+                else:
+                    try:
+                        payload = json.loads(raw)
+                    except ValueError:
+                        payload = None
+                    if payload != {"date": TODAY.isoformat()} or self.headers.get("hopegoo-encryptkey"):
+                        handler_errors.append(f"Account {slot:02d} did not send today's unencrypted JSON date")
+                        self.respond({"status": 80001, "body": None})
+                        return
+                    if self.headers.get("Content-Type") != "application/json; charset=utf-8":
+                        handler_errors.append(f"Account {slot:02d} JSON content type missing")
                 if self.headers.get("accept-encoding") != "gzip, deflate":
                     handler_errors.append("Transport encoding header was not replaced")
                 if slot == 5:

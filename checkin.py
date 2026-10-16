@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Replay user-owned Hopegoo captures; keep all credential values out of reports."""
+"""Check in with captured Hopegoo sessions and today's date; never log credentials."""
 
 from __future__ import annotations
 
@@ -299,7 +299,15 @@ def check_account(account: Account, transport: HttpTransport, mode: str, today: 
     submission_status = "unknown"
     try:
         request = account.signin
-        response = transport.post(request.url, request.headers, request.body)
+        # Captured ciphertext contains the capture day's business date. The API
+        # also accepts JSON with the same session; never pair JSON with its old
+        # encryption header or replay a previous day's encrypted date.
+        headers = {key: value for key, value in request.headers.items()
+                   if key not in {"hopegoo-encryptkey", "traceparent", "content-encoding"}}
+        headers["content-type"] = "application/json; charset=utf-8"
+        body = json.dumps({"date": today.isoformat()}, separators=(",", ":")).encode("utf-8")
+        print(f"{account.label}：签到请求日期：{today.isoformat()}（动态 JSON）")
+        response = transport.post(request.url, headers, body)
         submission_http = 200
         code = response.get("status")
         if is_int(code) and 0 <= code <= 1000000:
