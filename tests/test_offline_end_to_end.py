@@ -47,7 +47,6 @@ class OfflineEndToEndTests(unittest.TestCase):
     def test_ten_accounts_real_http_report_and_one_aggregate_sms(self):
         bundles = {slot: synthetic_account(slot) for slot in range(1, 11)}
         records = []
-        query_states = []
         handler_errors = []
         sms_payloads = []
         states = {slot: {"signed": slot == 2, "days": 11 if slot == 2 else slot - 1}
@@ -85,32 +84,25 @@ class OfflineEndToEndTests(unittest.TestCase):
                 token = self.headers.get("hopegoo-token", "")
                 slot = next((number for number in bundles
                              if bundles[number]["query"]["headers"]["hopegoo-token"] == token), None)
-                if slot is None or self.path not in (query_path, signin_path):
+                if slot is None or self.path != signin_path:
                     handler_errors.append("Unexpected account or endpoint")
                     self.respond({"status": 404}, status=404)
                     return
                 records.append((slot, self.path))
-                kind = "query" if self.path == query_path else "signin"
-                expected = bundles[slot][kind]
-                if kind == "query" and raw != expected["body"].encode("utf-8"):
-                    handler_errors.append(f"Account {slot:02d} query body changed")
+                expected = bundles[slot]["signin"]
                 for key in ("hopegoo-token", "cookie"):
                     if self.headers.get(key) != expected["headers"][key]:
                         handler_errors.append(f"Account {slot:02d} paired header changed")
-                if kind == "query":
-                    if self.headers.get("hopegoo-encryptkey") != expected["headers"]["hopegoo-encryptkey"]:
-                        handler_errors.append(f"Account {slot:02d} query encryption header changed")
-                else:
-                    try:
-                        payload = json.loads(raw)
-                    except ValueError:
-                        payload = None
-                    if payload != {"date": TODAY.isoformat()} or self.headers.get("hopegoo-encryptkey"):
-                        handler_errors.append(f"Account {slot:02d} did not send today's unencrypted JSON date")
-                        self.respond({"status": 80001, "body": None})
-                        return
-                    if self.headers.get("Content-Type") != "application/json; charset=utf-8":
-                        handler_errors.append(f"Account {slot:02d} JSON content type missing")
+                try:
+                    payload = json.loads(raw)
+                except ValueError:
+                    payload = None
+                if payload != {"date": TODAY.isoformat()} or self.headers.get("hopegoo-encryptkey"):
+                    handler_errors.append(f"Account {slot:02d} did not send today's unencrypted JSON date")
+                    self.respond({"status": 80001, "body": None})
+                    return
+                if self.headers.get("Content-Type") != "application/json; charset=utf-8":
+                    handler_errors.append(f"Account {slot:02d} JSON content type missing")
                 if self.headers.get("accept-encoding") != "gzip, deflate":
                     handler_errors.append("Transport encoding header was not replaced")
                 if slot == 5:
@@ -118,21 +110,14 @@ class OfflineEndToEndTests(unittest.TestCase):
                     self.respond({"message": token + "-private-rejection"}, status=401)
                     return
                 state = states[slot]
-                if kind == "query":
-                    query_states.append((slot, state["signed"], state["days"]))
-                    self.respond({"status": 200, "message": "Request Success", "body": {
-                        "continuousDays": state["days"], "todayStatus": int(state["signed"]),
-                        "checkinInfoList": [{"today": 1, "status": int(state["signed"]),
-                                             "dateText2": TODAY.isoformat()}],
-                    }}, encoding="gzip")
-                else:
-                    already_signed = state["signed"]
-                    if not already_signed:
-                        state["signed"] = True
-                        state["days"] += 1
-                    # A misleading repeat reward must never appear as a newly earned reward.
-                    self.respond({"status": 200, "body": {"coins": 777 if already_signed else 5}},
-                                 encoding="deflate")
+                already_signed = state["signed"]
+                if not already_signed:
+                    state["signed"] = True
+                    state["days"] += 1
+                # A misleading repeat reward must never appear as newly earned.
+                self.respond({"status": 80002 if already_signed else 200,
+                              "body": {"coins": 777 if already_signed else 5,
+                                       "continuousDays": state["days"]}}, encoding="deflate")
 
         server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         server.daemon_threads = True
@@ -190,22 +175,20 @@ class OfflineEndToEndTests(unittest.TestCase):
             self.assertEqual(result.label, f"{slot:02d}")
             calls = [path for recorded_slot, path in records if recorded_slot == slot]
             if slot == 5:
-                self.assertEqual(calls, [query_path])
-                self.assertEqual((result.status, result.submission_status), ("failed", "not_sent"))
+                self.assertEqual(calls, [signin_path])
+                self.assertEqual((result.status, result.submission_status), ("failed", "rejected"))
                 self.assertIn("登录会话失效或被拒绝", result.reason)
             else:
-                self.assertEqual(calls, [query_path, signin_path, query_path])
-                self.assertEqual((result.submission_status, result.submission_http, result.submission_code),
-                                 ("accepted", 200, 200))
+                self.assertEqual(calls, [signin_path])
                 self.assertTrue(states[slot]["signed"])
                 if slot == 2:
                     self.assertEqual((result.status, result.days, result.coins), ("already", 11, None))
-                    self.assertEqual([state[1:] for state in query_states if state[0] == slot],
-                                     [(True, 11), (True, 11)])
+                    self.assertEqual((result.submission_status, result.submission_http, result.submission_code),
+                                     ("already", 200, 80002))
                 else:
                     self.assertEqual((result.status, result.days, result.coins), ("success", slot, 5))
-                    self.assertEqual([state[1:] for state in query_states if state[0] == slot],
-                                     [(False, slot - 1), (True, slot)])
+                    self.assertEqual((result.submission_status, result.submission_http, result.submission_code),
+                                     ("accepted", 200, 200))
         self.assertEqual(len(sms_payloads), 1)
         self.assertEqual(records[-1], ("sms", "/send"))
         payload = sms_payloads[0]
@@ -220,7 +203,7 @@ class OfflineEndToEndTests(unittest.TestCase):
         self.assertIn("10：成功，+5 G-coins，连续10天", payload["content"])
         self.assertNotIn("777", payload["content"])
         self.assertIn("| 10 | 接口已接受 | 200 | 200 |", summary_text)
-        self.assertIn("| 05 | 未提交 | 未知 | 未知 |", summary_text)
+        self.assertIn("| 05 | 接口返回失败 | 401 | 未知 |", summary_text)
         public_outputs = stdout.getvalue() + stderr.getvalue() + report_text + summary_text
         private_values = ["synthetic-pushplus-token", "synthetic-cmcc-option", "private-rejection"]
         for bundle in bundles.values():

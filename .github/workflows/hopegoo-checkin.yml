@@ -2,14 +2,14 @@ name: Hopegoo daily check-in
 
 on:
   schedule:
-    # UTC 16:08 = 北京时间下一天 00:08。
-    - cron: '8 16 * * *'
-    # UTC 17:08 = 北京时间下一天 01:08；备用运行同样先查已签状态。
-    - cron: '8 17 * * *'
+    # UTC 16:19 = 北京时间下一天 00:19。
+    - cron: '19 16 * * *'
+    # UTC 01:18 = 北京时间当天 09:18；每天固定独立运行。
+    - cron: '18 1 * * *'
   workflow_dispatch:
     inputs:
       mode:
-        description: 'query 只验证账号；checkin 查询后签到并发送汇总'
+        description: 'checkin 直接单次签到并发送汇总；query 仅供只读排查'
         type: choice
         options:
           - checkin
@@ -28,14 +28,14 @@ jobs:
   checkin:
     name: Online Hopegoo check-in and SMS
     runs-on: ubuntu-latest
-    # Ten accounts can each use up to three attempts for both status queries.
-    timeout-minutes: 50
+    # One 30-second request per account, plus setup and notification time.
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v6
         with:
           python-version: '3.13'
-      - name: Online check-in and verify
+      - name: Submit check-in once
         env:
           HOPEGOO_MODE: ${{ github.event_name == 'schedule' && 'checkin' || inputs.mode || 'checkin' }}
           HOPEGOO_ACCOUNT_01: ${{ secrets.HOPEGOO_ACCOUNT_01 }}
@@ -48,7 +48,7 @@ jobs:
           HOPEGOO_ACCOUNT_08: ${{ secrets.HOPEGOO_ACCOUNT_08 }}
           HOPEGOO_ACCOUNT_09: ${{ secrets.HOPEGOO_ACCOUNT_09 }}
           HOPEGOO_ACCOUNT_10: ${{ secrets.HOPEGOO_ACCOUNT_10 }}
-        run: python checkin.py --mode "$HOPEGOO_MODE" --skip-signed --report "$RUNNER_TEMP/hopegoo-report.json"
+        run: python checkin.py --mode "$HOPEGOO_MODE" --report "$RUNNER_TEMP/hopegoo-report.json"
       - name: Always submit cmcc SMS summary
         if: always() && (github.event_name == 'schedule' || inputs.mode == 'checkin')
         env:

@@ -15,7 +15,6 @@ import re
 import socket
 import ssl
 import sys
-import time
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, timedelta
 from typing import Any, Mapping
@@ -35,8 +34,6 @@ ALREADY_SIGNED_CODE = 80002
 PUSH_URL = "https://www.pushplus.plus/send"
 MAX_RESPONSE_BYTES = 1024 * 1024
 MAX_SECRET_BYTES = 48 * 1024
-QUERY_RETRY_DELAYS = (5, 10)
-TRANSIENT_HTTP_STATUSES = {408, 429, 500, 502, 503, 504}
 DROP_HEADERS = {
     "host", "content-length", "accept-encoding", "connection", "keep-alive",
     "proxy-authenticate", "proxy-authorization", "te", "trailer",
@@ -47,10 +44,9 @@ DROP_HEADERS = {
 class SafeError(Exception):
     """Only messages created by this program, never raw service responses."""
 
-    def __init__(self, message: str, *, http_status: int | None = None, retryable: bool = False):
+    def __init__(self, message: str, *, http_status: int | None = None):
         super().__init__(message)
         self.http_status = http_status
-        self.retryable = retryable
 
 
 def is_int(value: Any) -> bool:
@@ -172,30 +168,27 @@ class HttpTransport:
             with self.opener.open(request, timeout=self.timeout) as response:
                 http_status = response.status
                 if response.status != 200:
-                    raise SafeError(f"接口返回 HTTP {response.status}", http_status=response.status,
-                                    retryable=response.status in TRANSIENT_HTTP_STATUSES)
+                    raise SafeError(f"接口返回 HTTP {response.status}", http_status=response.status)
                 expected_length = response.length
                 raw = response.read(MAX_RESPONSE_BYTES + 1)
                 if len(raw) > MAX_RESPONSE_BYTES:
                     raise SafeError("接口响应过大", http_status=http_status)
                 if expected_length is not None and len(raw) != expected_length:
-                    raise SafeError("接口响应不完整", http_status=http_status, retryable=True)
+                    raise SafeError("接口响应不完整", http_status=http_status)
                 encoding = response.headers.get("Content-Encoding", "identity").lower()
         except urllib.error.HTTPError as error:
             reason = "登录会话失效或被拒绝" if error.code in (401, 403) else f"接口返回 HTTP {error.code}"
             error.close()
-            raise SafeError(reason, http_status=error.code,
-                            retryable=error.code in TRANSIENT_HTTP_STATUSES) from None
+            raise SafeError(reason, http_status=error.code) from None
         except (TimeoutError, socket.timeout):
-            raise SafeError("请求超时", http_status=http_status, retryable=True) from None
+            raise SafeError("请求超时", http_status=http_status) from None
         except urllib.error.URLError as error:
             reason = "请求超时" if isinstance(error.reason, (TimeoutError, socket.timeout)) else "网络连接失败"
-            raise SafeError(reason, http_status=http_status,
-                            retryable=not isinstance(error.reason, ssl.SSLCertVerificationError)) from None
+            raise SafeError(reason, http_status=http_status) from None
         except http.client.HTTPException:
-            raise SafeError("接口响应不完整", http_status=http_status, retryable=True) from None
+            raise SafeError("接口响应不完整", http_status=http_status) from None
         except OSError:
-            raise SafeError("网络请求失败", http_status=http_status, retryable=True) from None
+            raise SafeError("网络请求失败", http_status=http_status) from None
         except ValueError:
             raise SafeError("网络请求失败", http_status=http_status) from None
         try:
@@ -269,29 +262,20 @@ class Result:
 
 def query_account(account: Account, transport: HttpTransport, today: date) -> CalendarState:
     request = account.query
-    attempts = len(QUERY_RETRY_DELAYS) + 1
-    for attempt in range(attempts):
-        try:
-            return calendar_state(transport.post(request.url, request.headers, request.body), today)
-        except SafeError as error:
-            if not error.retryable or attempt == attempts - 1:
-                raise
-            delay = QUERY_RETRY_DELAYS[attempt]
-            print(f"{account.label}：查询暂时失败（{error}），{delay}秒后重试（{attempt + 2}/{attempts}）")
-            time.sleep(delay)
+    return calendar_state(transport.post(request.url, request.headers, request.body), today)
 
 
-def check_account(account: Account, transport: HttpTransport, mode: str, today: date,
-                  skip_signed: bool = False) -> Result:
-    try:
-        before = query_account(account, transport, today)
-    except SafeError as error:
-        return Result(account.label, "failed", reason=str(error))
-    if before.signed and (mode == "query" or skip_signed):
-        return Result(account.label, "already", days=before.days)
+def check_account(account: Account, transport: HttpTransport, mode: str, today: date) -> Result:
     if mode == "query":
-        return Result(account.label, "query_only", days=before.days)
+        try:
+            state = query_account(account, transport, today)
+        except SafeError as error:
+            return Result(account.label, "failed", reason=str(error))
+        return Result(account.label, "already" if state.signed else "query_only", days=state.days)
+    if mode != "checkin":
+        raise SafeError("运行模式无效")
 
+    days = None
     coins = None
     submission_error = None
     submission_http = None
@@ -312,13 +296,19 @@ def check_account(account: Account, transport: HttpTransport, mode: str, today: 
         code = response.get("status")
         if is_int(code) and 0 <= code <= 1000000:
             submission_code = code
+        data = response.get("body")
+        if isinstance(data, dict):
+            returned_days = data.get("continuousDays")
+            if is_int(returned_days) and 0 <= returned_days <= 100000:
+                days = returned_days
         if submission_code == ALREADY_SIGNED_CODE:
             # Confirmed by the user's live duplicate-submission validation.
-            # This does not imply a new reward or replace the post-query.
+            # The user explicitly wants the submission result without queries.
             submission_status = "already"
         else:
-            body = business_body(response)
-            reward = body.get("coins")
+            if submission_code != 200:
+                business_body(response)  # Raises a sanitized business failure.
+            reward = data.get("coins") if isinstance(data, dict) else None
             if is_int(reward) and 0 <= reward <= 1000000:
                 coins = reward
             submission_status = "accepted"
@@ -334,28 +324,17 @@ def check_account(account: Account, transport: HttpTransport, mode: str, today: 
         "submission_reason": submission_error or "",
     }
 
-    # Exactly one submission. Even a timeout may mean the server processed it.
-    try:
-        after = query_account(account, transport, today)
-    except SafeError as error:
-        return Result(account.label, "uncertain", reason="提交后查询未通过，" + str(error), **submission)
-    if after.signed:
-        if submission_status == "already":
-            return Result(account.label, "already", days=after.days,
-                          reason="接口返回已签到", **submission)
-        if submission_status == "rejected":
-            return Result(account.label, "failed", days=after.days, reason="当天已签到，提交接口返回失败，" + submission_error, **submission)
-        if submission_status == "unknown":
-            return Result(account.label, "uncertain", days=after.days, reason="当天已签到，提交响应未确认，" + submission_error, **submission)
-        if before.signed:
-            # A replay of an already signed day does not prove a new reward.
-            return Result(account.label, "already", days=after.days, reason="重复提交已接受", **submission)
-        return Result(account.label, "success", days=after.days, coins=coins, **submission)
-    return Result(account.label, "failed", days=after.days, reason=submission_error or "提交后仍未签到", **submission)
+    # Never query or resend after submission; a timeout may still have committed.
+    if submission_status == "already":
+        return Result(account.label, "already", days=days, **submission)
+    if submission_status == "accepted":
+        return Result(account.label, "success", days=days, coins=coins, **submission)
+    if submission_status == "rejected":
+        return Result(account.label, "failed", reason=submission_error or "签到接口拒绝请求", **submission)
+    return Result(account.label, "uncertain", reason="签到响应未确认，" + (submission_error or "结果未知"), **submission)
 
 
-def run_accounts(environment: Mapping[str, str], transport: HttpTransport, mode: str, today: date,
-                 skip_signed: bool = False) -> list[Result]:
+def run_accounts(environment: Mapping[str, str], transport: HttpTransport, mode: str, today: date) -> list[Result]:
     results = []
     for slot in range(1, 11):
         raw = environment.get(f"HOPEGOO_ACCOUNT_{slot:02d}", "")
@@ -363,7 +342,7 @@ def run_accounts(environment: Mapping[str, str], transport: HttpTransport, mode:
             continue
         try:
             account = Account.from_secret(raw, slot)
-            results.append(check_account(account, transport, mode, today, skip_signed))
+            results.append(check_account(account, transport, mode, today))
         except SafeError as error:
             results.append(Result(f"{slot:02d}", "failed", reason=str(error)))
         except Exception:
@@ -379,16 +358,16 @@ def format_message(results: list[Result], today: date) -> tuple[str, str]:
         first += f"｜待签{counts['query_only']}"
     lines = [first]
     for item in results:
-        days = "未知" if item.days is None else f"{item.days}天"
+        days = "" if item.days is None else f"，连续{item.days}天"
         if item.status == "success":
             reward = "奖励未知" if item.coins is None else f"+{item.coins} G-coins"
-            text = f"成功，{reward}，连续{days}"
+            text = f"成功，{reward}{days}"
         elif item.status == "already":
-            text = f"今日已签到，连续{days}"
+            text = f"今日已签到{days}"
             if item.reason:
                 text += "，" + item.reason
         elif item.status == "query_only":
-            text = f"尚未签到（仅查询），连续{days}"
+            text = f"尚未签到（仅查询）{days}"
         else:
             text = f"失败，{item.reason or '结果未知'}"
         lines.append(f"{item.label}：{text}")
@@ -530,7 +509,6 @@ def mask_credentials(environment: Mapping[str, str]) -> None:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mode", choices=("query", "checkin"), default="query")
-    parser.add_argument("--skip-signed", action="store_true", help="前查确认当天已签时跳过提交")
     parser.add_argument("--report", type=Path, default=Path("hopegoo-report.json"))
     parser.add_argument("--notify", action="store_true", help="Send summary from report; create failure summary if missing")
     args = parser.parse_args(argv)
@@ -555,13 +533,12 @@ def main(argv: list[str] | None = None) -> int:
         append_step_summary("\n**短信：**PushPlus 已接受 cmcc 通知请求；最终送达以手机和 PushPlus 记录为准。")
         return 0
     descriptions = {
-        "query": "联网查询，不提交签到",
-        "checkin": ("联网签到，前查已签则跳过，提交后查询确认" if args.skip_signed
-                    else "联网签到，当天已签也提交一次，随后查询确认"),
+        "query": "仅一次联网查询，不提交签到、不重试",
+        "checkin": "直接提交一次签到，不查询、不重试，按接口返回判定",
     }
     print(f"运行模式：{args.mode}（{descriptions[args.mode]}）")
     print(f"运行日期（北京时间）：{today.isoformat()}")
-    results = run_accounts(os.environ, transport, args.mode, today, args.skip_signed)
+    results = run_accounts(os.environ, transport, args.mode, today)
     write_report(args.report, results, today, args.mode)
     summarize_results(results, today)
     for item in results:
@@ -574,10 +551,7 @@ def main(argv: list[str] | None = None) -> int:
             detail = "签到提交接口返回失败" if item.submission_status == "rejected" else "签到提交响应未确认"
             print(f"{item.label}：{detail}（{http}{item.submission_reason}）")
         elif args.mode == "checkin":
-            if item.status == "already":
-                print(f"{item.label}：前查确认今日已签到，跳过提交")
-            else:
-                print(f"{item.label}：未提交签到请求，前置查询或账号配置未通过")
+            print(f"{item.label}：未提交签到请求，账号配置未通过")
     title, content = format_message(results, today)
     print(title + "\n" + content)
     return int(any(item.status in ("failed", "uncertain") for item in results))

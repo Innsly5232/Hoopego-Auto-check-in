@@ -55,6 +55,140 @@ class CheckinTests(unittest.TestCase):
     def setUp(self):
         self.account = checkin.Account.from_secret(secret(), 1)
 
+    def test_direct_success_uses_only_submission_response(self):
+        for body, coins, days in [({"coins": 5, "continuousDays": 3}, 5, 3), ({}, None, None), (None, None, None)]:
+            with self.subTest(body=body):
+                transport = FakeTransport({"status": 200, "body": body})
+                result = checkin.check_account(self.account, transport, "checkin", TODAY)
+                self.assertEqual((result.status, result.submission_status, result.coins, result.days),
+                                 ("success", "accepted", coins, days))
+                self.assertEqual([url for url, _, _ in transport.calls], [checkin.SIGNIN_URL])
+
+    def test_direct_duplicate_needs_no_query_and_never_claims_reward(self):
+        transport = FakeTransport({"status": 80002, "body": {"coins": 999}})
+        result = checkin.check_account(self.account, transport, "checkin", TODAY)
+        self.assertEqual((result.status, result.submission_status, result.submission_code),
+                         ("already", "already", 80002))
+        self.assertIsNone(result.coins)
+        self.assertIsNone(result.days)
+        self.assertEqual([url for url, _, _ in transport.calls], [checkin.SIGNIN_URL])
+        content = checkin.format_message([result], TODAY)[1]
+        self.assertEqual(content, "成功0｜已签1｜失败0\n01：今日已签到")
+        self.assertNotIn("连续", content)
+        self.assertNotIn("999", content)
+
+    def test_business_rejections_are_failures_without_queries_or_retries(self):
+        for code in (80001, 409, 80003, 500):
+            with self.subTest(code=code):
+                transport = FakeTransport({"status": code, "message": "dummy-private-backend-text", "body": None})
+                result = checkin.check_account(self.account, transport, "checkin", TODAY)
+                self.assertEqual((result.status, result.submission_status, result.submission_code),
+                                 ("failed", "rejected", code))
+                self.assertIn(str(code), result.reason)
+                self.assertNotIn("dummy-private", result.reason)
+                self.assertEqual([url for url, _, _ in transport.calls], [checkin.SIGNIN_URL])
+
+    def test_timeout_and_incomplete_response_are_not_retried_or_claimed_unsigned(self):
+        cases = [(checkin.SafeError("请求超时"), "uncertain", "unknown", None),
+                 (checkin.SafeError("接口响应格式异常", http_status=200), "uncertain", "unknown", 200),
+                 (checkin.SafeError("登录会话失效或被拒绝", http_status=403), "failed", "rejected", 403)]
+        for failure, status, submission, http in cases:
+            with self.subTest(reason=str(failure)):
+                transport = FakeTransport(failure)
+                result = checkin.check_account(self.account, transport, "checkin", TODAY)
+                self.assertEqual((result.status, result.submission_status, result.submission_http),
+                                 (status, submission, http))
+                self.assertEqual([url for url, _, _ in transport.calls], [checkin.SIGNIN_URL])
+                self.assertIsNone(result.coins)
+                if status == "uncertain":
+                    self.assertIn("签到响应未确认", result.reason)
+
+    def test_old_capture_generates_current_date_and_keeps_original_session(self):
+        self.account.signin.headers["traceparent"] = "dummy-captured-trace"
+        original_headers = dict(self.account.signin.headers)
+        original_body = self.account.signin.body
+        for today in (TODAY, TODAY + timedelta(days=1)):
+            with self.subTest(today=today):
+                transport = FakeTransport({"status": 200, "body": {"coins": 5}})
+                result = checkin.check_account(self.account, transport, "checkin", today)
+                self.assertEqual(result.status, "success")
+                self.assertEqual(len(transport.calls), 1)
+                url, headers, body = transport.calls[0]
+                self.assertEqual(url, self.account.signin.url)
+                self.assertEqual(json.loads(body), {"date": today.isoformat()})
+                for key in ("hopegoo-token", "cookie"):
+                    self.assertEqual(headers[key], original_headers[key])
+                for key in ("hopegoo-encryptkey", "traceparent", "content-length"):
+                    self.assertNotIn(key, headers)
+                self.assertEqual(headers["content-type"], "application/json; charset=utf-8")
+                self.assertEqual(self.account.signin.headers, original_headers)
+                self.assertEqual(self.account.signin.body, original_body)
+
+    def test_backup_submits_once_and_accepts_duplicate_response(self):
+        transport = FakeTransport({"status": 200, "body": {"coins": 5}}, {"status": 80002})
+        primary = checkin.check_account(self.account, transport, "checkin", TODAY)
+        backup = checkin.check_account(self.account, transport, "checkin", TODAY)
+        self.assertEqual((primary.status, backup.status), ("success", "already"))
+        self.assertEqual([url for url, _, _ in transport.calls], [checkin.SIGNIN_URL] * 2)
+        self.assertIsNone(backup.coins)
+
+    def test_optional_query_mode_is_single_read_only_request(self):
+        for response, expected in [(calendar(True, 2), "already"), (calendar(False, 1), "query_only"),
+                                   (calendar(False, 1, TODAY - timedelta(days=1)), "failed"),
+                                   ({"status": 80002}, "failed"), (checkin.SafeError("请求超时"), "failed")]:
+            with self.subTest(expected=expected):
+                transport = FakeTransport(response)
+                result = checkin.check_account(self.account, transport, "query", TODAY)
+                self.assertEqual(result.status, expected)
+                self.assertEqual([url for url, _, _ in transport.calls], [checkin.QUERY_URL])
+                self.assertEqual(transport.calls[0][2], self.account.query.body)
+
+    def test_direct_cli_notifies_success_already_and_failure_from_same_report(self):
+        cases = [({"status": 200, "body": {"coins": 5}}, 0, "成功1｜已签0｜失败0"),
+                 ({"status": 80002, "body": {"coins": 999}}, 0, "成功0｜已签1｜失败0"),
+                 ({"status": 80001}, 1, "成功0｜已签0｜失败1"),
+                 (checkin.SafeError("请求超时"), 1, "成功0｜已签0｜失败1")]
+        for response, expected_exit, expected_summary in cases:
+            with self.subTest(expected_summary=expected_summary):
+                transport = FakeTransport(response, {"code": 200})
+                output = io.StringIO()
+                environment = {"HOPEGOO_ACCOUNT_01": secret(), "PUSHPLUS_TOKEN": "dummy-push"}
+                with tempfile.TemporaryDirectory() as directory, mock.patch.dict("os.environ", environment, clear=True), \
+                        mock.patch("checkin.HttpTransport", return_value=transport), \
+                        mock.patch("checkin.current_date", return_value=TODAY), contextlib.redirect_stdout(output):
+                    report = Path(directory) / "report.json"
+                    code = checkin.main(["--mode", "checkin", "--report", str(report)])
+                    self.assertEqual(code, expected_exit)
+                    self.assertEqual(checkin.main(["--notify", "--report", str(report)]), 0)
+                self.assertEqual([url for url, _, _ in transport.calls], [checkin.SIGNIN_URL, checkin.PUSH_URL])
+                payload = json.loads(transport.calls[-1][2])
+                self.assertEqual(payload["channel"], "cmcc")
+                self.assertIn(expected_summary, payload["content"])
+                self.assertNotIn("999", payload["content"])
+                for private_text in ("dummy-session", "dummy-key", "dummy-push"):
+                    self.assertNotIn(private_text, output.getvalue())
+
+    def test_bad_account_does_not_block_other_accounts_or_notification(self):
+        environment = {"HOPEGOO_ACCOUNT_01": "not-json-dummy-private-text", "HOPEGOO_ACCOUNT_02": secret()}
+        transport = FakeTransport({"status": 200, "body": {}}, {"code": 200})
+        results = checkin.run_accounts(environment, transport, "checkin", TODAY)
+        self.assertEqual([(item.label, item.status) for item in results], [("01", "failed"), ("02", "success")])
+        title, content = checkin.format_message(results, TODAY)
+        checkin.push_message({"PUSHPLUS_TOKEN": "dummy-push"}, transport, title, content)
+        self.assertEqual([url for url, _, _ in transport.calls], [checkin.SIGNIN_URL, checkin.PUSH_URL])
+        self.assertIn("成功1｜已签0｜失败1", content)
+        self.assertNotIn("dummy-private", content)
+
+    def test_rejected_submission_does_not_stop_next_account_or_summary(self):
+        environment = {"HOPEGOO_ACCOUNT_01": secret("dummy-first"), "HOPEGOO_ACCOUNT_02": secret("dummy-second")}
+        transport = FakeTransport({"status": 80001}, {"status": 200, "body": {"coins": 5}}, {"code": 200})
+        results = checkin.run_accounts(environment, transport, "checkin", TODAY)
+        self.assertEqual([result.status for result in results], ["failed", "success"])
+        title, content = checkin.format_message(results, TODAY)
+        checkin.push_message({"PUSHPLUS_TOKEN": "dummy-push"}, transport, title, content)
+        self.assertEqual([url for url, _, _ in transport.calls], [checkin.SIGNIN_URL] * 2 + [checkin.PUSH_URL])
+        self.assertIn("成功1｜已签0｜失败1", content)
+
     def test_replay_preserves_opaque_body_and_paired_key(self):
         self.assertEqual(self.account.query.body, b"opaque-query==\n")
         self.assertEqual(self.account.signin.body, b"opaque-signin++==")
@@ -93,25 +227,6 @@ class CheckinTests(unittest.TestCase):
         with self.assertRaisesRegex(checkin.SafeError, "sectoken 不一致"):
             checkin.Account.from_secret(json.dumps(value), 1)
 
-    def test_scheduled_skip_signed_uses_only_one_query(self):
-        transport = FakeTransport(calendar(True, 2))
-        result = checkin.check_account(self.account, transport, "checkin", TODAY, skip_signed=True)
-        self.assertEqual((result.status, result.submission_status), ("already", "not_sent"))
-        self.assertEqual([url for url, _, _ in transport.calls], [checkin.QUERY_URL])
-
-    def test_duplicate_code_requires_signed_postquery_and_never_counts_reward(self):
-        transport = FakeTransport(calendar(False, 1),
-                                  {"status": 80002, "body": {"coins": 999}}, calendar(True, 2))
-        result = checkin.check_account(self.account, transport, "checkin", TODAY)
-        self.assertEqual((result.status, result.submission_status, result.submission_code),
-                         ("already", "already", 80002))
-        self.assertIsNone(result.coins)
-        self.assertIn("接口返回已签到", result.reason)
-        for after in (calendar(False, 1), checkin.SafeError("网络连接失败")):
-            with self.subTest(after=type(after).__name__):
-                transport = FakeTransport(calendar(False, 1), {"status": 80002}, after)
-                result = checkin.check_account(self.account, transport, "checkin", TODAY)
-                self.assertIn(result.status, ("failed", "uncertain"))
 
     def test_duplicate_result_report_roundtrip_and_summary(self):
         result = checkin.Result("01", "already", days=2, submission_status="already",
@@ -124,11 +239,6 @@ class CheckinTests(unittest.TestCase):
         self.assertIn("已签1｜失败0", content)
         self.assertNotIn("G-coins", content)
 
-    def test_duplicate_code_is_not_accepted_for_query(self):
-        transport = FakeTransport({"status": 80002})
-        result = checkin.check_account(self.account, transport, "checkin", TODAY)
-        self.assertEqual(result.status, "failed")
-        self.assertEqual(len(transport.calls), 1)
 
     def test_header_injection_and_compressed_body_are_rejected(self):
         for key, value in [("cookie", "fake\r\nInjected: true"), ("content-encoding", "gzip")]:
@@ -137,295 +247,6 @@ class CheckinTests(unittest.TestCase):
             with self.assertRaises(checkin.SafeError):
                 checkin.Account.from_secret(json.dumps(config), 1)
 
-    def test_already_signed_query_does_not_submit(self):
-        transport = FakeTransport(calendar(True, 2))
-        result = checkin.check_account(self.account, transport, "query", TODAY)
-        self.assertEqual((result.status, result.days, result.coins), ("already", 2, None))
-        self.assertEqual([item[0] for item in transport.calls], [checkin.QUERY_URL])
-
-    def test_checkin_submits_signed_account_once_without_claiming_reward(self):
-        transport = FakeTransport(calendar(True, 2), {"status": 200, "body": {"coins": 5}}, calendar(True, 2))
-        result = checkin.check_account(self.account, transport, "checkin", TODAY)
-        self.assertEqual((result.status, result.days, result.coins), ("already", 2, None))
-        self.assertEqual((result.submission_status, result.submission_code), ("accepted", 200))
-        self.assertEqual([item[0] for item in transport.calls], [checkin.QUERY_URL, checkin.SIGNIN_URL, checkin.QUERY_URL])
-        _, content = checkin.format_message([result], TODAY)
-        self.assertIn("今日已签到，连续2天，重复提交已接受", content)
-        self.assertNotIn("G-coins", content)
-
-    def test_replay_timeout_is_not_hidden_by_existing_signed_state(self):
-        transport = FakeTransport(calendar(True, 2), checkin.SafeError("请求超时"), calendar(True, 2))
-        result = checkin.check_account(self.account, transport, "checkin", TODAY)
-        self.assertEqual(result.status, "uncertain")
-        self.assertEqual(result.submission_status, "unknown")
-        self.assertIn("当天已签到，提交响应未确认，请求超时", result.reason)
-        self.assertIn("失败1", checkin.format_message([result], TODAY)[1])
-        self.assertEqual(sum(item[0] == checkin.SIGNIN_URL for item in transport.calls), 1)
-
-    def test_checkin_can_complete_unsigned_account(self):
-        transport = FakeTransport(calendar(False, 1), {"status": 200, "body": {"coins": 5}}, calendar(True, 2))
-        result = checkin.check_account(self.account, transport, "checkin", TODAY)
-        self.assertEqual((result.status, result.coins, result.days), ("success", 5, 2))
-        self.assertEqual(result.submission_status, "accepted")
-
-    def test_cli_replay_rejection_fails_and_notification_keeps_test_result(self):
-        transport = FakeTransport(calendar(True, 2),
-            {"status": 409, "message": "untrusted-dummy-private-text", "body": {}},
-            calendar(True, 2), {"code": 200})
-        output = io.StringIO()
-        environment = {"HOPEGOO_ACCOUNT_01": secret(), "PUSHPLUS_TOKEN": "dummy-push"}
-        with tempfile.TemporaryDirectory() as directory, mock.patch.dict("os.environ", environment, clear=True), \
-                mock.patch("checkin.HttpTransport", return_value=transport), mock.patch("checkin.current_date", return_value=TODAY), \
-                contextlib.redirect_stdout(output):
-            path = Path(directory) / "report.json"
-            code = checkin.main(["--mode", "checkin", "--report", str(path)])
-            self.assertEqual(code, 1)
-            result = checkin.read_report(path, TODAY)[0]
-            self.assertEqual((result.status, result.submission_status, result.submission_code), ("failed", "rejected", 409))
-            notify_code = checkin.main(["--notify", "--report", str(path)])
-        self.assertEqual(notify_code, 0)
-        self.assertEqual(sum(item[0] == checkin.SIGNIN_URL for item in transport.calls), 1)
-        self.assertIn("业务 status=409", output.getvalue())
-        for private_text in ("untrusted-dummy-private-text", "dummy-session", "dummy-key", "dummy-push"):
-            self.assertNotIn(private_text, output.getvalue())
-        payload = json.loads(transport.calls[-1][2])
-        self.assertEqual(payload["channel"], "cmcc")
-        self.assertIn("当天已签到", payload["content"])
-        self.assertIn("提交接口返回失败", payload["content"])
-        self.assertIn("成功0｜已签0｜失败1", payload["content"])
-
-    def test_cli_accepted_replay_passes_without_inventing_new_reward(self):
-        transport = FakeTransport(calendar(True, 2), {"status": 200, "body": {"coins": 5}}, calendar(True, 2))
-        output = io.StringIO()
-        with tempfile.TemporaryDirectory() as directory, mock.patch.dict("os.environ", {"HOPEGOO_ACCOUNT_01": secret()}, clear=True), \
-                mock.patch("checkin.HttpTransport", return_value=transport), mock.patch("checkin.current_date", return_value=TODAY), \
-                contextlib.redirect_stdout(output):
-            summary_path = Path(directory) / "summary.md"
-            with mock.patch.dict("os.environ", {"GITHUB_STEP_SUMMARY": str(summary_path)}):
-                code = checkin.main(["--mode", "checkin", "--report", str(Path(directory) / "report.json")])
-            summary = summary_path.read_text()
-        self.assertEqual(code, 0)
-        self.assertIn("运行模式：checkin", output.getvalue())
-        self.assertIn("签到提交接口通过（HTTP 200，业务 status=200）", output.getvalue())
-        self.assertNotIn("G-coins", output.getvalue())
-        self.assertIn("重复提交已接受", summary)
-        self.assertIn("| 01 | 接口已接受 | 200 | 200 |", summary)
-        for private_text in ("dummy-session", "dummy-key", "opaque-signin"):
-            self.assertNotIn(private_text, summary)
-
-    def test_replay_cannot_pass_without_post_query_confirmation(self):
-        transport = FakeTransport(calendar(True, 2), {"status": 200, "body": {"coins": 5}}, checkin.SafeError("网络连接失败"))
-        result = checkin.check_account(self.account, transport, "checkin", TODAY)
-        self.assertEqual(result.status, "uncertain")
-        self.assertEqual(result.submission_status, "accepted")
-        self.assertIsNone(result.coins)
-        self.assertEqual(result.reason, "提交后查询未通过，网络连接失败")
-
-    def test_post_query_old_date_does_not_confirm_cross_day_submission(self):
-        transport = FakeTransport(calendar(False, 0), {"status": 200, "body": {"coins": 5}},
-                                  calendar(True, 1, date(2026, 10, 11)))
-        result = checkin.check_account(self.account, transport, "checkin", TODAY)
-        self.assertEqual(result.status, "uncertain")
-        self.assertEqual(result.reason, "提交后查询未通过，返回日期不是今天")
-        self.assertIsNone(result.coins)
-        self.assertEqual(sum(item[0] == checkin.SIGNIN_URL for item in transport.calls), 1)
-
-    def test_http_rejection_is_distinct_from_unknown_submission_response(self):
-        transport = FakeTransport(calendar(True, 2),
-                                  checkin.SafeError("登录会话失效或被拒绝", http_status=403), calendar(True, 2))
-        result = checkin.check_account(self.account, transport, "checkin", TODAY)
-        self.assertEqual((result.status, result.submission_status, result.submission_http), ("failed", "rejected", 403))
-        self.assertIsNone(result.submission_code)
-        self.assertIn("当天已签到，提交接口返回失败", result.reason)
-
-    def test_one_submission_rejection_does_not_stop_next_account_or_sms(self):
-        environment = {"HOPEGOO_ACCOUNT_01": secret("dummy-first"), "HOPEGOO_ACCOUNT_02": secret("dummy-second")}
-        transport = FakeTransport(calendar(True, 2), {"status": 409, "body": {}}, calendar(True, 2),
-                                  calendar(False, 0), {"status": 200, "body": {"coins": 5}}, calendar(True, 1),
-                                  {"code": 200})
-        results = checkin.run_accounts(environment, transport, "checkin", TODAY)
-        self.assertEqual([(item.label, item.status, item.coins) for item in results], [("01", "failed", None), ("02", "success", 5)])
-        self.assertEqual(sum(item[0] == checkin.SIGNIN_URL for item in transport.calls), 2)
-        title, content = checkin.format_message(results, TODAY)
-        self.assertIn("成功1｜已签0｜失败1", content)
-        self.assertIn("当天已签到", content)
-        checkin.push_message({"PUSHPLUS_TOKEN": "dummy-push"}, transport, title, content)
-        self.assertEqual(sum(item[0] == checkin.PUSH_URL for item in transport.calls), 1)
-        self.assertEqual(json.loads(transport.calls[-1][2])["content"], content)
-
-    def test_unsigned_query_mode_never_submits(self):
-        transport = FakeTransport(calendar(False, 1))
-        result = checkin.check_account(self.account, transport, "query", TODAY)
-        self.assertEqual(result.status, "query_only")
-        self.assertEqual(len(transport.calls), 1)
-
-    def test_cross_day_checkin_requires_post_query_confirmation(self):
-        transport = FakeTransport(calendar(False, 1), {"status": 200, "body": {"coins": 5}}, calendar(True, 2))
-        result = checkin.check_account(self.account, transport, "checkin", TODAY)
-        self.assertEqual((result.status, result.coins, result.days), ("success", 5, 2))
-        self.assertEqual([item[0] for item in transport.calls], [checkin.QUERY_URL, checkin.SIGNIN_URL, checkin.QUERY_URL])
-        self.assertEqual(json.loads(transport.calls[1][2]), {"date": TODAY.isoformat()})
-
-    def test_same_old_capture_generates_each_days_date_without_old_encryption_headers(self):
-        self.account.signin.headers["traceparent"] = "dummy-captured-trace"
-        original_headers = dict(self.account.signin.headers)
-        original_body = self.account.signin.body
-        for today in (TODAY, TODAY + timedelta(days=1)):
-            with self.subTest(today=today):
-                transport = FakeTransport(calendar(False, 1, today), {"status": 200, "body": {"coins": 5}},
-                                          calendar(True, 2, today))
-                result = checkin.check_account(self.account, transport, "checkin", today, skip_signed=True)
-                self.assertEqual(result.status, "success")
-                url, headers, body = transport.calls[1]
-                self.assertEqual(url, self.account.signin.url)
-                self.assertEqual(json.loads(body), {"date": today.isoformat()})
-                for key in ("hopegoo-token", "cookie"):
-                    self.assertEqual(headers[key], original_headers[key])
-                for key in ("hopegoo-encryptkey", "traceparent", "content-length"):
-                    self.assertNotIn(key, headers)
-                self.assertEqual(headers["content-type"], "application/json; charset=utf-8")
-                self.assertEqual(self.account.signin.headers, original_headers)
-                self.assertEqual(self.account.signin.body, original_body)
-                self.assertEqual(transport.calls[0][2], self.account.query.body)
-
-    def test_date_rejection_is_not_treated_as_success_or_retried(self):
-        transport = FakeTransport(calendar(False, 1), {"status": 80001, "body": None}, calendar(False, 1))
-        result = checkin.check_account(self.account, transport, "checkin", TODAY, skip_signed=True)
-        self.assertEqual((result.status, result.submission_status, result.submission_code),
-                         ("failed", "rejected", 80001))
-        self.assertEqual(sum(url == checkin.SIGNIN_URL for url, _, _ in transport.calls), 1)
-
-    def test_old_calendar_cannot_trigger_new_day_submission(self):
-        for mode in ("query", "checkin"):
-            with self.subTest(mode=mode):
-                transport = FakeTransport(calendar(False, 1, date(2026, 10, 11)))
-                result = checkin.check_account(self.account, transport, mode, TODAY)
-                self.assertEqual(result.status, "failed")
-                self.assertEqual(result.reason, "返回日期不是今天")
-                self.assertEqual(len(transport.calls), 1)
-
-    def test_unknown_status_or_inconsistent_calendar_does_not_submit(self):
-        for field, value in [("todayStatus", 2), ("todayStatus", True), ("continuousDays", "1")]:
-            response = calendar(False, 1)
-            response["body"][field] = value
-            transport = FakeTransport(response)
-            self.assertEqual(checkin.check_account(self.account, transport, "checkin", TODAY).status, "failed")
-            self.assertEqual(len(transport.calls), 1)
-        response = calendar(False, 1)
-        response["body"]["checkinInfoList"][0]["status"] = 1
-        transport = FakeTransport(response)
-        self.assertEqual(checkin.check_account(self.account, transport, "checkin", TODAY).status, "failed")
-
-    def test_query_failure_never_submits(self):
-        for mode in ("query", "checkin"):
-            with self.subTest(mode=mode):
-                transport = FakeTransport(checkin.SafeError("请求超时"))
-                result = checkin.check_account(self.account, transport, mode, TODAY)
-                self.assertEqual(result.reason, "请求超时")
-                self.assertEqual(len(transport.calls), 1)
-
-    def test_transient_prequery_retries_preserve_capture_and_submit_only_once(self):
-        transport = FakeTransport(checkin.SafeError("请求超时", retryable=True),
-                                  checkin.SafeError("接口返回 HTTP 503", http_status=503, retryable=True),
-                                  calendar(False, 1), {"status": 200, "body": {"coins": 5}}, calendar(True, 2))
-        output = io.StringIO()
-        with mock.patch("checkin.time.sleep") as sleep, contextlib.redirect_stdout(output):
-            result = checkin.check_account(self.account, transport, "checkin", TODAY, skip_signed=True)
-        self.assertEqual(result.status, "success")
-        self.assertEqual(sleep.call_args_list, [mock.call(5), mock.call(10)])
-        self.assertEqual([url for url, _, _ in transport.calls],
-                         [checkin.QUERY_URL] * 3 + [checkin.SIGNIN_URL, checkin.QUERY_URL])
-        self.assertTrue(all(call == transport.calls[0] for call in transport.calls[:3]))
-        self.assertEqual(transport.calls[0][2], self.account.query.body)
-        self.assertIn("重试（3/3）", output.getvalue())
-        for private_text in ("dummy-session", "dummy-key", "opaque-query"):
-            self.assertNotIn(private_text, output.getvalue())
-
-    def test_query_retry_exhaustion_never_submits_in_either_mode(self):
-        for mode in ("query", "checkin"):
-            with self.subTest(mode=mode):
-                transport = FakeTransport(*(checkin.SafeError("请求超时", retryable=True) for _ in range(3)))
-                with mock.patch("checkin.time.sleep") as sleep, contextlib.redirect_stdout(io.StringIO()):
-                    result = checkin.check_account(self.account, transport, mode, TODAY, skip_signed=True)
-                self.assertEqual((result.status, result.submission_status, result.reason),
-                                 ("failed", "not_sent", "请求超时"))
-                self.assertEqual([url for url, _, _ in transport.calls], [checkin.QUERY_URL] * 3)
-                self.assertEqual(sleep.call_args_list, [mock.call(5), mock.call(10)])
-
-    def test_auth_business_and_calendar_failures_are_not_retried(self):
-        responses = [checkin.SafeError("登录会话失效或被拒绝", http_status=403),
-                     {"status": 80002}, calendar(False, 1, date(2026, 10, 11))]
-        for response in responses:
-            with self.subTest(response=type(response).__name__), mock.patch("checkin.time.sleep") as sleep:
-                transport = FakeTransport(response)
-                result = checkin.check_account(self.account, transport, "checkin", TODAY, skip_signed=True)
-                self.assertEqual((result.status, result.submission_status), ("failed", "not_sent"))
-                self.assertEqual([url for url, _, _ in transport.calls], [checkin.QUERY_URL])
-                sleep.assert_not_called()
-
-    def test_postquery_retry_does_not_retry_even_retryable_signin_timeout(self):
-        submissions = [({"status": 200, "body": {"coins": 5}}, "success"),
-                       (checkin.SafeError("请求超时", retryable=True), "uncertain")]
-        for response, expected in submissions:
-            with self.subTest(expected=expected):
-                transport = FakeTransport(calendar(False, 1), response,
-                                          checkin.SafeError("网络连接失败", retryable=True), calendar(True, 2))
-                with mock.patch("checkin.time.sleep") as sleep, contextlib.redirect_stdout(io.StringIO()):
-                    result = checkin.check_account(self.account, transport, "checkin", TODAY, skip_signed=True)
-                self.assertEqual(result.status, expected)
-                self.assertEqual([url for url, _, _ in transport.calls],
-                                 [checkin.QUERY_URL, checkin.SIGNIN_URL, checkin.QUERY_URL, checkin.QUERY_URL])
-                sleep.assert_called_once_with(5)
-                if expected == "uncertain":
-                    self.assertIn("提交响应未确认", result.reason)
-                    self.assertIsNone(result.coins)
-
-    def test_postquery_retry_exhaustion_retains_uncertain_submission(self):
-        transport = FakeTransport(calendar(False, 1), {"status": 200, "body": {"coins": 5}},
-                                  *(checkin.SafeError("请求超时", retryable=True) for _ in range(3)))
-        with mock.patch("checkin.time.sleep") as sleep, contextlib.redirect_stdout(io.StringIO()):
-            result = checkin.check_account(self.account, transport, "checkin", TODAY, skip_signed=True)
-        self.assertEqual((result.status, result.submission_status), ("uncertain", "accepted"))
-        self.assertEqual(sleep.call_args_list, [mock.call(5), mock.call(10)])
-        self.assertEqual([url for url, _, _ in transport.calls],
-                         [checkin.QUERY_URL, checkin.SIGNIN_URL] + [checkin.QUERY_URL] * 3)
-        self.assertIsNone(result.coins)
-
-    def test_backup_run_skips_account_already_signed_by_primary(self):
-        transport = FakeTransport(calendar(False, 1), {"status": 200, "body": {"coins": 5}},
-                                  calendar(True, 2), calendar(True, 2))
-        primary = checkin.check_account(self.account, transport, "checkin", TODAY, skip_signed=True)
-        backup = checkin.check_account(self.account, transport, "checkin", TODAY, skip_signed=True)
-        self.assertEqual((primary.status, backup.status, backup.submission_status),
-                         ("success", "already", "not_sent"))
-        self.assertEqual([url for url, _, _ in transport.calls],
-                         [checkin.QUERY_URL, checkin.SIGNIN_URL, checkin.QUERY_URL, checkin.QUERY_URL])
-
-    def test_submission_timeout_is_verified_and_never_retried(self):
-        transport = FakeTransport(calendar(False, 1), checkin.SafeError("请求超时"), calendar(True, 2))
-        result = checkin.check_account(self.account, transport, "checkin", TODAY)
-        self.assertEqual((result.status, result.coins, result.submission_status), ("uncertain", None, "unknown"))
-        self.assertIn("当天已签到，提交响应未确认", result.reason)
-        self.assertEqual(sum(item[0] == checkin.SIGNIN_URL for item in transport.calls), 1)
-
-    def test_success_response_without_signed_state_is_failure(self):
-        transport = FakeTransport(calendar(False, 1), {"status": 200, "body": {"coins": 5}}, calendar(False, 1))
-        result = checkin.check_account(self.account, transport, "checkin", TODAY)
-        self.assertEqual(result.status, "failed")
-        self.assertIsNone(result.coins)
-        self.assertEqual(sum(item[0] == checkin.SIGNIN_URL for item in transport.calls), 1)
-
-    def test_failed_verification_reports_unknown_without_claiming_reward(self):
-        transport = FakeTransport(calendar(False, 1), {"status": 200, "body": {"coins": 5}}, checkin.SafeError("网络连接失败"))
-        result = checkin.check_account(self.account, transport, "checkin", TODAY)
-        self.assertEqual(result.status, "uncertain")
-        self.assertIsNone(result.coins)
-
-    def test_bad_account_does_not_prevent_other_accounts_running(self):
-        environment = {"HOPEGOO_ACCOUNT_01": "not-json-dummy-private-text", "HOPEGOO_ACCOUNT_02": secret()}
-        results = checkin.run_accounts(environment, FakeTransport(calendar(True, 2), {"status": 200, "body": {}}, calendar(True, 2)), "checkin", TODAY)
-        self.assertEqual([(item.label, item.status) for item in results], [("01", "failed"), ("02", "already")])
-        self.assertNotIn("dummy-private", results[0].reason)
 
     def test_no_account_configuration_produces_failure_summary(self):
         results = checkin.run_accounts({}, FakeTransport(), "checkin", TODAY)
@@ -611,32 +432,30 @@ class TransportTests(unittest.TestCase):
         self.assertEqual(str(raised.exception), "登录会话失效或被拒绝")
         self.assertNotIn("untrusted-dummy-backend-text", str(raised.exception))
 
-    def test_only_transient_http_errors_are_marked_retryable(self):
+    def test_http_errors_are_never_retried(self):
         for status in (408, 429, 500, 502, 503, 504, 400, 401, 403, 404, 501):
             with self.subTest(status=status):
                 before = len(self.seen)
                 with self.assertRaises(checkin.SafeError) as raised:
                     checkin.HttpTransport(timeout=2).post(self.base + f"/status/{status}", {}, b"opaque")
                 self.assertEqual(raised.exception.http_status, status)
-                self.assertEqual(raised.exception.retryable, status in (408, 429, 500, 502, 503, 504))
                 self.assertEqual(len(self.seen) - before, 1)
                 self.assertNotIn("untrusted-dummy-backend-text", str(raised.exception))
 
     def test_network_failure_metadata_does_not_make_transport_retry_posts(self):
-        failures = [(TimeoutError("untrusted-dummy-backend-text"), True),
-                    (urllib.error.URLError(ConnectionResetError("untrusted-dummy-backend-text")), True),
-                    (urllib.error.URLError(ssl.SSLCertVerificationError("untrusted-dummy-backend-text")), False)]
-        for failure, retryable in failures:
+        failures = [TimeoutError("untrusted-dummy-backend-text"),
+                    urllib.error.URLError(ConnectionResetError("untrusted-dummy-backend-text")),
+                    urllib.error.URLError(ssl.SSLCertVerificationError("untrusted-dummy-backend-text"))]
+        for failure in failures:
             with self.subTest(failure=type(failure).__name__):
                 transport = checkin.HttpTransport(timeout=2)
                 with mock.patch.object(transport.opener, "open", side_effect=failure) as post:
                     with self.assertRaises(checkin.SafeError) as raised:
                         transport.post(checkin.SIGNIN_URL, {}, b"opaque")
                 post.assert_called_once()
-                self.assertEqual(raised.exception.retryable, retryable)
                 self.assertNotIn("untrusted-dummy-backend-text", str(raised.exception))
 
-    def test_incomplete_submission_still_queries_and_never_retries(self):
+    def test_incomplete_submission_never_queries_or_retries(self):
         for path in ("/truncated-gzip", "/truncated-length", "/truncated-chunked"):
             with self.subTest(path=path):
                 network = checkin.HttpTransport(timeout=2)
@@ -656,10 +475,10 @@ class TransportTests(unittest.TestCase):
                 self.assertEqual(result.status, "uncertain")
                 self.assertEqual(result.submission_status, "unknown")
                 self.assertEqual(result.submission_http, 200)
-                self.assertEqual(result.days, 1)
+                self.assertIsNone(result.days)
                 self.assertIsNone(result.coins)
-                self.assertIn("当天已签到，提交响应未确认", result.reason)
-                self.assertEqual(calls, [checkin.QUERY_URL, checkin.SIGNIN_URL, checkin.QUERY_URL])
+                self.assertIn("签到响应未确认", result.reason)
+                self.assertEqual(calls, [checkin.SIGNIN_URL])
                 self.assertEqual(self.seen[before:], [(path, b'{"date":"2026-10-12"}')])
 
     def test_compressed_response_cannot_exceed_expanded_limit(self):
