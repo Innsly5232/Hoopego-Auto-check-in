@@ -15,6 +15,7 @@ import re
 import socket
 import ssl
 import sys
+import time
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, timedelta
 from typing import Any, Mapping
@@ -34,6 +35,8 @@ ALREADY_SIGNED_CODE = 80002
 PUSH_URL = "https://www.pushplus.plus/send"
 MAX_RESPONSE_BYTES = 1024 * 1024
 MAX_SECRET_BYTES = 48 * 1024
+QUERY_RETRY_DELAYS = (5, 10)
+TRANSIENT_HTTP_STATUSES = {408, 429, 500, 502, 503, 504}
 DROP_HEADERS = {
     "host", "content-length", "accept-encoding", "connection", "keep-alive",
     "proxy-authenticate", "proxy-authorization", "te", "trailer",
@@ -44,9 +47,10 @@ DROP_HEADERS = {
 class SafeError(Exception):
     """Only messages created by this program, never raw service responses."""
 
-    def __init__(self, message: str, *, http_status: int | None = None):
+    def __init__(self, message: str, *, http_status: int | None = None, retryable: bool = False):
         super().__init__(message)
         self.http_status = http_status
+        self.retryable = retryable
 
 
 def is_int(value: Any) -> bool:
@@ -168,26 +172,31 @@ class HttpTransport:
             with self.opener.open(request, timeout=self.timeout) as response:
                 http_status = response.status
                 if response.status != 200:
-                    raise SafeError(f"接口返回 HTTP {response.status}", http_status=response.status)
+                    raise SafeError(f"接口返回 HTTP {response.status}", http_status=response.status,
+                                    retryable=response.status in TRANSIENT_HTTP_STATUSES)
                 expected_length = response.length
                 raw = response.read(MAX_RESPONSE_BYTES + 1)
                 if len(raw) > MAX_RESPONSE_BYTES:
                     raise SafeError("接口响应过大", http_status=http_status)
                 if expected_length is not None and len(raw) != expected_length:
-                    raise SafeError("接口响应不完整", http_status=http_status)
+                    raise SafeError("接口响应不完整", http_status=http_status, retryable=True)
                 encoding = response.headers.get("Content-Encoding", "identity").lower()
         except urllib.error.HTTPError as error:
             reason = "登录会话失效或被拒绝" if error.code in (401, 403) else f"接口返回 HTTP {error.code}"
             error.close()
-            raise SafeError(reason, http_status=error.code) from None
+            raise SafeError(reason, http_status=error.code,
+                            retryable=error.code in TRANSIENT_HTTP_STATUSES) from None
         except (TimeoutError, socket.timeout):
-            raise SafeError("请求超时", http_status=http_status) from None
+            raise SafeError("请求超时", http_status=http_status, retryable=True) from None
         except urllib.error.URLError as error:
             reason = "请求超时" if isinstance(error.reason, (TimeoutError, socket.timeout)) else "网络连接失败"
-            raise SafeError(reason, http_status=http_status) from None
+            raise SafeError(reason, http_status=http_status,
+                            retryable=not isinstance(error.reason, ssl.SSLCertVerificationError)) from None
         except http.client.HTTPException:
-            raise SafeError("接口响应不完整", http_status=http_status) from None
-        except (OSError, ValueError):
+            raise SafeError("接口响应不完整", http_status=http_status, retryable=True) from None
+        except OSError:
+            raise SafeError("网络请求失败", http_status=http_status, retryable=True) from None
+        except ValueError:
             raise SafeError("网络请求失败", http_status=http_status) from None
         try:
             if encoding == "gzip":
@@ -260,7 +269,16 @@ class Result:
 
 def query_account(account: Account, transport: HttpTransport, today: date) -> CalendarState:
     request = account.query
-    return calendar_state(transport.post(request.url, request.headers, request.body), today)
+    attempts = len(QUERY_RETRY_DELAYS) + 1
+    for attempt in range(attempts):
+        try:
+            return calendar_state(transport.post(request.url, request.headers, request.body), today)
+        except SafeError as error:
+            if not error.retryable or attempt == attempts - 1:
+                raise
+            delay = QUERY_RETRY_DELAYS[attempt]
+            print(f"{account.label}：查询暂时失败（{error}），{delay}秒后重试（{attempt + 2}/{attempts}）")
+            time.sleep(delay)
 
 
 def check_account(account: Account, transport: HttpTransport, mode: str, today: date,

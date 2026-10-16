@@ -4,6 +4,8 @@ on:
   schedule:
     # UTC 16:08 = 北京时间下一天 00:08。
     - cron: '8 16 * * *'
+    # UTC 17:08 = 北京时间下一天 01:08；备用运行同样先查已签状态。
+    - cron: '8 17 * * *'
   workflow_dispatch:
     inputs:
       mode:
@@ -26,7 +28,8 @@ jobs:
   checkin:
     name: Online Hopegoo check-in and SMS
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    # Ten accounts can each use up to three attempts for both status queries.
+    timeout-minutes: 50
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v6

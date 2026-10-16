@@ -5,10 +5,12 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import io
 import json
 from pathlib import Path
+import ssl
 import tempfile
 import threading
 import unittest
 from unittest import mock
+import urllib.error
 
 import checkin
 
@@ -293,6 +295,83 @@ class CheckinTests(unittest.TestCase):
                 self.assertEqual(result.reason, "请求超时")
                 self.assertEqual(len(transport.calls), 1)
 
+    def test_transient_prequery_retries_preserve_capture_and_submit_only_once(self):
+        transport = FakeTransport(checkin.SafeError("请求超时", retryable=True),
+                                  checkin.SafeError("接口返回 HTTP 503", http_status=503, retryable=True),
+                                  calendar(False, 1), {"status": 200, "body": {"coins": 5}}, calendar(True, 2))
+        output = io.StringIO()
+        with mock.patch("checkin.time.sleep") as sleep, contextlib.redirect_stdout(output):
+            result = checkin.check_account(self.account, transport, "checkin", TODAY, skip_signed=True)
+        self.assertEqual(result.status, "success")
+        self.assertEqual(sleep.call_args_list, [mock.call(5), mock.call(10)])
+        self.assertEqual([url for url, _, _ in transport.calls],
+                         [checkin.QUERY_URL] * 3 + [checkin.SIGNIN_URL, checkin.QUERY_URL])
+        self.assertTrue(all(call == transport.calls[0] for call in transport.calls[:3]))
+        self.assertEqual(transport.calls[0][2], self.account.query.body)
+        self.assertIn("重试（3/3）", output.getvalue())
+        for private_text in ("dummy-session", "dummy-key", "opaque-query"):
+            self.assertNotIn(private_text, output.getvalue())
+
+    def test_query_retry_exhaustion_never_submits_in_either_mode(self):
+        for mode in ("query", "checkin"):
+            with self.subTest(mode=mode):
+                transport = FakeTransport(*(checkin.SafeError("请求超时", retryable=True) for _ in range(3)))
+                with mock.patch("checkin.time.sleep") as sleep, contextlib.redirect_stdout(io.StringIO()):
+                    result = checkin.check_account(self.account, transport, mode, TODAY, skip_signed=True)
+                self.assertEqual((result.status, result.submission_status, result.reason),
+                                 ("failed", "not_sent", "请求超时"))
+                self.assertEqual([url for url, _, _ in transport.calls], [checkin.QUERY_URL] * 3)
+                self.assertEqual(sleep.call_args_list, [mock.call(5), mock.call(10)])
+
+    def test_auth_business_and_calendar_failures_are_not_retried(self):
+        responses = [checkin.SafeError("登录会话失效或被拒绝", http_status=403),
+                     {"status": 80002}, calendar(False, 1, date(2026, 10, 11))]
+        for response in responses:
+            with self.subTest(response=type(response).__name__), mock.patch("checkin.time.sleep") as sleep:
+                transport = FakeTransport(response)
+                result = checkin.check_account(self.account, transport, "checkin", TODAY, skip_signed=True)
+                self.assertEqual((result.status, result.submission_status), ("failed", "not_sent"))
+                self.assertEqual([url for url, _, _ in transport.calls], [checkin.QUERY_URL])
+                sleep.assert_not_called()
+
+    def test_postquery_retry_does_not_retry_even_retryable_signin_timeout(self):
+        submissions = [({"status": 200, "body": {"coins": 5}}, "success"),
+                       (checkin.SafeError("请求超时", retryable=True), "uncertain")]
+        for response, expected in submissions:
+            with self.subTest(expected=expected):
+                transport = FakeTransport(calendar(False, 1), response,
+                                          checkin.SafeError("网络连接失败", retryable=True), calendar(True, 2))
+                with mock.patch("checkin.time.sleep") as sleep, contextlib.redirect_stdout(io.StringIO()):
+                    result = checkin.check_account(self.account, transport, "checkin", TODAY, skip_signed=True)
+                self.assertEqual(result.status, expected)
+                self.assertEqual([url for url, _, _ in transport.calls],
+                                 [checkin.QUERY_URL, checkin.SIGNIN_URL, checkin.QUERY_URL, checkin.QUERY_URL])
+                sleep.assert_called_once_with(5)
+                if expected == "uncertain":
+                    self.assertIn("提交响应未确认", result.reason)
+                    self.assertIsNone(result.coins)
+
+    def test_postquery_retry_exhaustion_retains_uncertain_submission(self):
+        transport = FakeTransport(calendar(False, 1), {"status": 200, "body": {"coins": 5}},
+                                  *(checkin.SafeError("请求超时", retryable=True) for _ in range(3)))
+        with mock.patch("checkin.time.sleep") as sleep, contextlib.redirect_stdout(io.StringIO()):
+            result = checkin.check_account(self.account, transport, "checkin", TODAY, skip_signed=True)
+        self.assertEqual((result.status, result.submission_status), ("uncertain", "accepted"))
+        self.assertEqual(sleep.call_args_list, [mock.call(5), mock.call(10)])
+        self.assertEqual([url for url, _, _ in transport.calls],
+                         [checkin.QUERY_URL, checkin.SIGNIN_URL] + [checkin.QUERY_URL] * 3)
+        self.assertIsNone(result.coins)
+
+    def test_backup_run_skips_account_already_signed_by_primary(self):
+        transport = FakeTransport(calendar(False, 1), {"status": 200, "body": {"coins": 5}},
+                                  calendar(True, 2), calendar(True, 2))
+        primary = checkin.check_account(self.account, transport, "checkin", TODAY, skip_signed=True)
+        backup = checkin.check_account(self.account, transport, "checkin", TODAY, skip_signed=True)
+        self.assertEqual((primary.status, backup.status, backup.submission_status),
+                         ("success", "already", "not_sent"))
+        self.assertEqual([url for url, _, _ in transport.calls],
+                         [checkin.QUERY_URL, checkin.SIGNIN_URL, checkin.QUERY_URL, checkin.QUERY_URL])
+
     def test_submission_timeout_is_verified_and_never_retried(self):
         transport = FakeTransport(calendar(False, 1), checkin.SafeError("请求超时"), calendar(True, 2))
         result = checkin.check_account(self.account, transport, "checkin", TODAY)
@@ -438,6 +517,11 @@ class TransportTests(unittest.TestCase):
             def do_POST(self):
                 body = self.rfile.read(int(self.headers.get("Content-Length", "0")))
                 seen.append((self.path, body))
+                if self.path.startswith("/status/"):
+                    self.send_response(int(self.path.rsplit("/", 1)[1]))
+                    self.end_headers()
+                    self.wfile.write(b"untrusted-dummy-backend-text")
+                    return
                 if self.path == "/redirect":
                     self.send_response(302)
                     self.send_header("Location", "/must-not-receive-credentials")
@@ -497,6 +581,31 @@ class TransportTests(unittest.TestCase):
         self.assertEqual(raised.exception.http_status, 403)
         self.assertEqual(str(raised.exception), "登录会话失效或被拒绝")
         self.assertNotIn("untrusted-dummy-backend-text", str(raised.exception))
+
+    def test_only_transient_http_errors_are_marked_retryable(self):
+        for status in (408, 429, 500, 502, 503, 504, 400, 401, 403, 404, 501):
+            with self.subTest(status=status):
+                before = len(self.seen)
+                with self.assertRaises(checkin.SafeError) as raised:
+                    checkin.HttpTransport(timeout=2).post(self.base + f"/status/{status}", {}, b"opaque")
+                self.assertEqual(raised.exception.http_status, status)
+                self.assertEqual(raised.exception.retryable, status in (408, 429, 500, 502, 503, 504))
+                self.assertEqual(len(self.seen) - before, 1)
+                self.assertNotIn("untrusted-dummy-backend-text", str(raised.exception))
+
+    def test_network_failure_metadata_does_not_make_transport_retry_posts(self):
+        failures = [(TimeoutError("untrusted-dummy-backend-text"), True),
+                    (urllib.error.URLError(ConnectionResetError("untrusted-dummy-backend-text")), True),
+                    (urllib.error.URLError(ssl.SSLCertVerificationError("untrusted-dummy-backend-text")), False)]
+        for failure, retryable in failures:
+            with self.subTest(failure=type(failure).__name__):
+                transport = checkin.HttpTransport(timeout=2)
+                with mock.patch.object(transport.opener, "open", side_effect=failure) as post:
+                    with self.assertRaises(checkin.SafeError) as raised:
+                        transport.post(checkin.SIGNIN_URL, {}, b"opaque")
+                post.assert_called_once()
+                self.assertEqual(raised.exception.retryable, retryable)
+                self.assertNotIn("untrusted-dummy-backend-text", str(raised.exception))
 
     def test_incomplete_submission_still_queries_and_never_retries(self):
         for path in ("/truncated-gzip", "/truncated-length", "/truncated-chunked"):
