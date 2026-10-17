@@ -28,7 +28,7 @@ import zlib
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 QUERY_URL = "https://app.hopegoo.com/sea_shell/manta-you/memberCheckin/listCheckin"
 SIGNIN_URL = "https://app.hopegoo.com/sea_shell/manta-you/memberCheckin/performCheckin"
-ALLOWED_HOSTS = {"app.hopegoo.com", "app.reshg.com"}
+ALLOWED_HOSTS = {"app.hopegoo.com", "app.reshg.com", "apptxy.hopegoo.com"}
 ALLOWED_PATHS = {urlsplit(QUERY_URL).path, urlsplit(SIGNIN_URL).path}
 ALREADY_SIGNED_CODE = 80002
 PUSH_URL = "https://www.pushplus.plus/send"
@@ -123,7 +123,7 @@ class CapturedRequest:
 @dataclass(frozen=True)
 class Account:
     label: str
-    query: CapturedRequest
+    query: CapturedRequest | None
     signin: CapturedRequest
 
     @classmethod
@@ -134,14 +134,17 @@ class Account:
             value = json.loads(raw)
         except (ValueError, TypeError):
             raise SafeError("账号配置不是有效 JSON") from None
-        if not isinstance(value, dict) or not is_int(value.get("schema_version")) or value["schema_version"] != 1:
+        if (not isinstance(value, dict) or not is_int(value.get("schema_version"))
+                or value["schema_version"] not in (1, 2)):
             raise SafeError("账号配置版本不支持")
-        query = CapturedRequest.from_config(value.get("query"), QUERY_URL)
         signin = CapturedRequest.from_config(value.get("signin"), SIGNIN_URL)
-        if urlsplit(query.url).netloc.lower() != urlsplit(signin.url).netloc.lower():
-            raise SafeError("查询与签到请求来自不同域名")
-        if not hmac.compare_digest(query.headers["hopegoo-token"].encode(), signin.headers["hopegoo-token"].encode()):
-            raise SafeError("两个请求的登录会话不一致")
+        query = None
+        if value["schema_version"] == 1 or "query" in value:
+            query = CapturedRequest.from_config(value.get("query"), QUERY_URL)
+            if urlsplit(query.url).netloc.lower() != urlsplit(signin.url).netloc.lower():
+                raise SafeError("查询与签到请求来自不同域名")
+            if not hmac.compare_digest(query.headers["hopegoo-token"].encode(), signin.headers["hopegoo-token"].encode()):
+                raise SafeError("两个请求的登录会话不一致")
         return cls(f"{slot:02d}", query, signin)
 
 
@@ -262,6 +265,8 @@ class Result:
 
 def query_account(account: Account, transport: HttpTransport, today: date) -> CalendarState:
     request = account.query
+    if request is None:
+        raise SafeError("此账号仅配置签到，未提供查询请求")
     return calendar_state(transport.post(request.url, request.headers, request.body), today)
 
 

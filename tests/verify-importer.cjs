@@ -8,7 +8,7 @@ const html = fs.readFileSync(path.resolve(__dirname, '..', 'tools', 'hopegoo-sec
 const script = html.match(/<script>([\s\S]*?)<\/script>/)[1];
 const context = {module: {exports: {}}, TextEncoder};
 vm.runInNewContext(script, context);
-const {buildSecret, DataError, QUERY_URL, SIGNIN_URL} = context.module.exports;
+const {buildSecret, buildSigninSecret, DataError, QUERY_URL, SIGNIN_URL} = context.module.exports;
 let checks = 0;
 function check(name, run) {
   run();
@@ -68,11 +68,44 @@ check('wrong endpoint or domain is rejected', () => {
   rejects(goodSignin(), goodQuery());
 });
 check('new capture domain is preserved in both request bundles', () => {
-  const query = har(QUERY_URL.replace('app.hopegoo.com', 'app.reshg.com'));
-  const signin = har(SIGNIN_URL.replace('app.hopegoo.com', 'app.reshg.com'));
-  const restored = JSON.parse(make(query, signin).payload);
-  assert.equal(restored.query.url, query.log.entries[0].request.url);
+  for (const host of ['app.reshg.com', 'apptxy.hopegoo.com']) {
+    const query = har(QUERY_URL.replace('app.hopegoo.com', host));
+    const signin = har(SIGNIN_URL.replace('app.hopegoo.com', host));
+    const restored = JSON.parse(make(query, signin).payload);
+    assert.equal(restored.query.url, query.log.entries[0].request.url);
+    assert.equal(restored.signin.url, signin.log.entries[0].request.url);
+  }
+});
+check('one HAR with repeated same-session sign-ins produces a sign-in-only account', () => {
+  const signin = har(SIGNIN_URL.replace('app.hopegoo.com', 'apptxy.hopegoo.com'));
+  signin.log.entries.push(signin.log.entries[0]);
+  const built = buildSigninSecret(JSON.stringify(signin), '02');
+  const restored = JSON.parse(built.payload);
+  assert.equal(restored.schema_version, 2);
+  assert.equal(restored.name, '账号02');
+  assert.equal(restored.query, undefined);
   assert.equal(restored.signin.url, signin.log.entries[0].request.url);
+  assert.equal(restored.signin.body, 'dummy-encoded-body==');
+  assert.equal(built.records, 2);
+});
+check('sign-in-only import rejects mixed sessions, mixed origins and lookalike hosts', () => {
+  for (const alternate of [har(SIGNIN_URL, 'dummy-different-session'),
+                           har(SIGNIN_URL.replace('app.hopegoo.com', 'apptxy.hopegoo.com'))]) {
+    const signin = goodSignin();
+    signin.log.entries.push(alternate.log.entries[0]);
+    assert.throws(() => buildSigninSecret(JSON.stringify(signin), '02'), error => error instanceof DataError);
+  }
+  const lookalike = har(SIGNIN_URL.replace('app.hopegoo.com', 'apptxy.hopegoo.com.untrusted.invalid'));
+  assert.throws(() => buildSigninSecret(JSON.stringify(lookalike), '02'), error => error instanceof DataError);
+  assert.throws(() => buildSigninSecret(JSON.stringify(goodQuery()), '02'), error => error instanceof DataError);
+});
+check('sign-in-only import keeps slot, size and cookie/session validation', () => {
+  assert.throws(() => buildSigninSecret(JSON.stringify(goodSignin()), '11'), error => error instanceof DataError);
+  assert.throws(() => buildSigninSecret(JSON.stringify(har(SIGNIN_URL, undefined, 'A'.repeat(50000))), '02'),
+                error => error instanceof DataError);
+  const bad = goodSignin();
+  bad.log.entries[0].request.headers.push({name: 'cookie', value: 'sectoken=wrong-session'});
+  assert.throws(() => buildSigninSecret(JSON.stringify(bad), '02'), error => error instanceof DataError);
 });
 check('mixed domains and cookie/token conflicts fail before serialization', () => {
   rejects(har(QUERY_URL.replace('app.hopegoo.com', 'app.reshg.com')));
@@ -153,6 +186,16 @@ async function browserFlow() {
   const before = copies.length;
   await elements.copy.handlers.click();
   assert.equal(copies.length, before);
+  elements.queryFile.files = [];
+  elements.slot.value = '02';
+  elements.slot.handlers.change();
+  await elements.validate.handlers.click();
+  assert.equal(elements.copy.disabled, false);
+  assert.match(elements.result.textContent, /仅签到配置/);
+  await elements.copy.handlers.click();
+  assert.equal(JSON.parse(copies[copies.length - 1]).schema_version, 2);
+  assert.equal(JSON.parse(copies[copies.length - 1]).name, '账号02');
+  assert.match(elements.result.textContent, /HOPEGOO_ACCOUNT_02/);
   checks += 1;
   process.stdout.write('PASS file selection, validation, copy and clear browser flow\n');
 }

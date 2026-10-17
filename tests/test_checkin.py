@@ -217,6 +217,49 @@ class CheckinTests(unittest.TestCase):
         self.assertEqual(account.query.url, value["query"]["url"])
         self.assertEqual(account.signin.url, value["signin"]["url"])
 
+    def test_signin_only_config_supports_captured_apptxy_origin_without_query(self):
+        value = json.loads(secret("dummy-second-session"))
+        value["schema_version"] = 2
+        del value["query"]
+        value["signin"]["url"] = value["signin"]["url"].replace("app.hopegoo.com", "apptxy.hopegoo.com")
+        account = checkin.Account.from_secret(json.dumps(value), 2)
+        self.assertEqual(account.label, "02")
+        self.assertIsNone(account.query)
+        transport = FakeTransport({"status": 80002})
+        result = checkin.check_account(account, transport, "checkin", TODAY)
+        self.assertEqual(result.status, "already")
+        self.assertEqual([url for url, _, _ in transport.calls], [value["signin"]["url"]])
+        self.assertEqual(json.loads(transport.calls[0][2]), {"date": TODAY.isoformat()})
+        self.assertEqual(transport.calls[0][1]["hopegoo-token"], "dummy-second-session")
+        self.assertNotIn("hopegoo-encryptkey", transport.calls[0][1])
+        read_only = FakeTransport()
+        result = checkin.check_account(account, read_only, "query", TODAY)
+        self.assertEqual(result.status, "failed")
+        self.assertIn("未提供查询请求", result.reason)
+        self.assertEqual(read_only.calls, [])
+
+    def test_legacy_and_signin_only_accounts_share_summary_without_mixing_sessions(self):
+        second = json.loads(secret("dummy-second-session"))
+        second["schema_version"] = 2
+        del second["query"]
+        second["signin"]["url"] = second["signin"]["url"].replace("app.hopegoo.com", "apptxy.hopegoo.com")
+        environment = {"HOPEGOO_ACCOUNT_01": secret("dummy-first-session"),
+                       "HOPEGOO_ACCOUNT_02": json.dumps(second)}
+        transport = FakeTransport({"status": 200, "body": {"coins": 5}}, {"status": 80002})
+        results = checkin.run_accounts(environment, transport, "checkin", TODAY)
+        self.assertEqual([(item.label, item.status) for item in results], [("01", "success"), ("02", "already")])
+        self.assertEqual([headers["hopegoo-token"] for _, headers, _ in transport.calls],
+                         ["dummy-first-session", "dummy-second-session"])
+        self.assertIn("成功1｜已签1｜失败0", checkin.format_message(results, TODAY)[1])
+
+    def test_missing_query_is_only_allowed_in_explicit_signin_only_schema(self):
+        value = json.loads(secret())
+        del value["query"]
+        for version in (1, 3, True):
+            value["schema_version"] = version
+            with self.subTest(version=version), self.assertRaises(checkin.SafeError):
+                checkin.Account.from_secret(json.dumps(value), 2)
+
     def test_new_secret_cannot_mix_domains_or_conflicting_cookie(self):
         value = json.loads(secret())
         value["query"]["url"] = value["query"]["url"].replace("app.hopegoo.com", "app.reshg.com")

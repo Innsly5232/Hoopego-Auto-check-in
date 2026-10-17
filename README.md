@@ -10,16 +10,18 @@
 
 初次抓包可先阅读 [Reqable 抓包与 HAR 导出指引（PDF，10 页）](docs/Reqable_Hopegoo_Guide.pdf)，按步骤完成 iPhone 与 Mac 连接、证书安装、Hopegoo 请求抓取和 HAR 导出。需要保存到本机时可使用 [PDF 直接下载链接](https://github.com/Innsly5232/Hoopego-Auto-check-in/raw/refs/heads/main/docs/Reqable_Hopegoo_Guide.pdf)。
 
-为同一账号、同一次登录会话导出两条完整 HAR 请求，保留原始请求体：
+日常自动签到只需本人账号的完整签到 HAR，保留原始请求头及请求体。已支持：
 
-- 查询：`/sea_shell/manta-you/memberCheckin/listCheckin`
 - 签到：`/sea_shell/manta-you/memberCheckin/performCheckin`
+- 查询（可选，仅供主动排查）：`/sea_shell/manta-you/memberCheckin/listCheckin`
 
-已支持 `app.hopegoo.com` 和新抓包使用的 `app.reshg.com`。脚本保留真实域名；查询和签到须来自同一域名，Token 须一致，Cookie 中的会话值也须与 Token 匹配。两份 HAR 可以保留原文件名。
+已支持精确域名 `app.hopegoo.com`、`app.reshg.com` 和 `apptxy.hopegoo.com`。脚本保留捕获的真实域名。只提供签到 HAR 时，可包含同一域名、同一登录会话的多条签到记录，导入器逐条校验后使用第一条；混合域名或会话会被拒绝。Cookie 中的会话值须与 Token 匹配。
 
 现有导入器生成的完整账号 JSON 继续兼容，无需因本次日期修复重新抓包或更新 Secret。抓包中的原始签到请求仍用于配置校验和手动排查；自动脚本实际发送的是 `{"date":"当天的 YYYY-MM-DD"}`，并移除旧的 `hopegoo-encryptkey`，通过 HTTPS 发送。
 
-使用本地 [HAR 导入工具](tools/hopegoo-secret-importer.html)：下载 HTML 后在浏览器打开，选择账号编号和两个 HAR，点击“校验并生成配置”，再复制账号配置。页面只在本机处理文件，禁止网络访问，不保存浏览器持久数据。
+使用本地 [HAR 导入工具](tools/hopegoo-secret-importer.html)：下载 HTML 后在浏览器打开，选择账号编号和签到 HAR，查询文件留空，点击“校验并生成配置”，再复制账号配置。这会生成版本 2 的仅签到配置；无需查询 HAR。页面只在本机处理文件，禁止网络访问，不保存浏览器持久数据。
+
+原有版本 1 的双 HAR 配置继续兼容。需要保留手动查询能力时，也可同时选择同一会话的查询和签到 HAR；两个文件各包含一条对应记录，且域名、Token 必须匹配。版本 2 只提供签到时，显式选择 `query` 会在本机报告缺少查询资料，不发送请求。
 
 在 GitHub 仓库的 **Settings → Secrets and variables → Actions** 中保存为：
 
@@ -29,7 +31,7 @@
 | `HOPEGOO_ACCOUNT_02` 至 `HOPEGOO_ACCOUNT_10` | 其他账号各自的配对配置，可选 |
 | `PUSHPLUS_TOKEN` | 用于接收 cmcc 汇总的 PushPlus Token |
 
-空账号槽位会被跳过；格式错误的账号会独立报告失败，不阻止其他账号。新增账号应捕获自己的查询和签到请求，不能只把旧账号请求中的 Token 替换成新账号 Token。
+空账号槽位会被跳过；格式错误的账号会独立报告失败，不阻止其他账号。新增账号使用其自己的签到 HAR，并选择独立账号编号；不要在旧账号配置中直接替换 Token。
 
 `PUSHPLUS_OPTION` 为可选的仓库 Variable；使用原 PushPlus 配置需要该项时再填写。cmcc 已固定，不需要配置 `PUSHPLUS_CHANNEL`。
 
