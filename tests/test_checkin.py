@@ -168,6 +168,32 @@ class CheckinTests(unittest.TestCase):
                 for private_text in ("dummy-session", "dummy-key", "dummy-push"):
                     self.assertNotIn(private_text, output.getvalue())
 
+    def test_cli_can_select_only_account_two_and_notify_only_its_result(self):
+        environment = {"HOPEGOO_ACCOUNT_01": secret("dummy-first-session"),
+                       "HOPEGOO_ACCOUNT_02": secret("dummy-second-session"),
+                       "HOPEGOO_ACCOUNT_03": secret("dummy-third-session"), "PUSHPLUS_TOKEN": "dummy-push"}
+        transport = FakeTransport({"status": 80002}, {"code": 200})
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict("os.environ", environment, clear=True), \
+                mock.patch("checkin.HttpTransport", return_value=transport), \
+                mock.patch("checkin.current_date", return_value=TODAY), contextlib.redirect_stdout(io.StringIO()):
+            report = Path(directory) / "report.json"
+            self.assertEqual(checkin.main(["--mode", "checkin", "--account", "02", "--report", str(report)]), 0)
+            self.assertEqual([(item.label, item.status) for item in checkin.read_report(report, TODAY)], [("02", "already")])
+            self.assertEqual(checkin.main(["--notify", "--report", str(report)]), 0)
+        self.assertEqual([url for url, _, _ in transport.calls], [checkin.SIGNIN_URL, checkin.PUSH_URL])
+        self.assertEqual(transport.calls[0][1]["hopegoo-token"], "dummy-second-session")
+        message = json.loads(transport.calls[-1][2])["content"]
+        self.assertIn("02：今日已签到", message)
+        self.assertNotIn("01：", message)
+        self.assertNotIn("03：", message)
+
+    def test_missing_selected_account_never_falls_back_to_account_one(self):
+        transport = FakeTransport()
+        results = checkin.run_accounts({"HOPEGOO_ACCOUNT_01": secret()}, transport, "checkin", TODAY, selected_slot=2)
+        self.assertEqual([(item.label, item.status) for item in results], [("02", "failed")])
+        self.assertIn("账号配置缺失", results[0].reason)
+        self.assertEqual(transport.calls, [])
+
     def test_bad_account_does_not_block_other_accounts_or_notification(self):
         environment = {"HOPEGOO_ACCOUNT_01": "not-json-dummy-private-text", "HOPEGOO_ACCOUNT_02": secret()}
         transport = FakeTransport({"status": 200, "body": {}}, {"code": 200})

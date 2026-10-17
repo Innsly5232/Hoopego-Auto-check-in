@@ -339,9 +339,11 @@ def check_account(account: Account, transport: HttpTransport, mode: str, today: 
     return Result(account.label, "uncertain", reason="签到响应未确认，" + (submission_error or "结果未知"), **submission)
 
 
-def run_accounts(environment: Mapping[str, str], transport: HttpTransport, mode: str, today: date) -> list[Result]:
+def run_accounts(environment: Mapping[str, str], transport: HttpTransport, mode: str, today: date,
+                 selected_slot: int | None = None) -> list[Result]:
     results = []
-    for slot in range(1, 11):
+    slots = range(1, 11) if selected_slot is None else (selected_slot,)
+    for slot in slots:
         raw = environment.get(f"HOPEGOO_ACCOUNT_{slot:02d}", "")
         if not raw:
             continue
@@ -352,7 +354,7 @@ def run_accounts(environment: Mapping[str, str], transport: HttpTransport, mode:
             results.append(Result(f"{slot:02d}", "failed", reason=str(error)))
         except Exception:
             results.append(Result(f"{slot:02d}", "failed", reason="脚本执行异常，请查看运行记录"))
-    return results or [Result("01", "failed", reason="账号配置缺失，请填写 GitHub Secret")]
+    return results or [Result(f"{selected_slot or 1:02d}", "failed", reason="账号配置缺失，请填写 GitHub Secret")]
 
 
 def format_message(results: list[Result], today: date) -> tuple[str, str]:
@@ -514,6 +516,8 @@ def mask_credentials(environment: Mapping[str, str]) -> None:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mode", choices=("query", "checkin"), default="query")
+    parser.add_argument("--account", choices=["all"] + [f"{slot:02d}" for slot in range(1, 11)],
+                        default="all", help="只运行指定账号；默认运行全部已配置账号")
     parser.add_argument("--report", type=Path, default=Path("hopegoo-report.json"))
     parser.add_argument("--notify", action="store_true", help="Send summary from report; create failure summary if missing")
     args = parser.parse_args(argv)
@@ -543,7 +547,9 @@ def main(argv: list[str] | None = None) -> int:
     }
     print(f"运行模式：{args.mode}（{descriptions[args.mode]}）")
     print(f"运行日期（北京时间）：{today.isoformat()}")
-    results = run_accounts(os.environ, transport, args.mode, today)
+    print(f"运行账号：{args.account}")
+    selected_slot = None if args.account == "all" else int(args.account)
+    results = run_accounts(os.environ, transport, args.mode, today, selected_slot)
     write_report(args.report, results, today, args.mode)
     summarize_results(results, today)
     for item in results:

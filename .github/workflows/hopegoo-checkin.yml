@@ -16,6 +16,12 @@ on:
           - query
         default: checkin
         required: true
+      account:
+        description: '运行账号；all 为全部，单账号测试可选 02 等编号'
+        type: choice
+        options: [all, '01', '02', '03', '04', '05', '06', '07', '08', '09', '10']
+        default: all
+        required: true
 
 permissions:
   contents: read
@@ -30,6 +36,8 @@ jobs:
     runs-on: ubuntu-latest
     # One 30-second request per account, plus setup and notification time.
     timeout-minutes: 10
+    env:
+      HOPEGOO_ACCOUNT_SLOT: ${{ github.event_name == 'schedule' && 'all' || inputs.account || 'all' }}
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v6
@@ -48,7 +56,7 @@ jobs:
           HOPEGOO_ACCOUNT_08: ${{ secrets.HOPEGOO_ACCOUNT_08 }}
           HOPEGOO_ACCOUNT_09: ${{ secrets.HOPEGOO_ACCOUNT_09 }}
           HOPEGOO_ACCOUNT_10: ${{ secrets.HOPEGOO_ACCOUNT_10 }}
-        run: python checkin.py --mode "$HOPEGOO_MODE" --report "$RUNNER_TEMP/hopegoo-report.json"
+        run: python checkin.py --mode "$HOPEGOO_MODE" --account "$HOPEGOO_ACCOUNT_SLOT" --report "$RUNNER_TEMP/hopegoo-report.json"
       - name: Always submit cmcc SMS summary
         if: always() && (github.event_name == 'schedule' || inputs.mode == 'checkin')
         env:
@@ -70,7 +78,9 @@ jobs:
               def redirect_request(self, *args):
                   return None
           title = 'Hopegoo签到 ' + datetime.datetime.now(ZoneInfo('Asia/Shanghai')).strftime('%m/%d')
-          payload = {'token': token, 'title': title, 'content': '成功0｜已签0｜失败1\n01：失败，工作流启动失败，请查看运行记录', 'template': 'txt', 'channel': 'cmcc'}
+          account = os.environ.get('HOPEGOO_ACCOUNT_SLOT', 'all')
+          label = '全部账号' if account == 'all' else account
+          payload = {'token': token, 'title': title, 'content': f'成功0｜已签0｜失败1\n{label}：失败，工作流启动失败，请查看运行记录', 'template': 'txt', 'channel': 'cmcc'}
           option = os.environ.get('PUSHPLUS_OPTION', '').strip()
           if option:
               payload['option'] = option
