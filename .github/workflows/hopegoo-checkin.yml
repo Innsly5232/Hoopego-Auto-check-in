@@ -2,9 +2,9 @@ name: Hopegoo daily check-in
 
 on:
   schedule:
-    # UTC 16:19 = 北京时间下一天 00:19。
+    # UTC 16:19 = 北京时间下一天 00:19；启动后随机等待 0–20 分钟。
     - cron: '19 16 * * *'
-    # UTC 01:18 = 北京时间当天 09:18；每天固定独立运行。
+    # UTC 01:18 = 北京时间当天 09:18；备用任务同样随机等待。
     - cron: '18 1 * * *'
   workflow_dispatch:
     inputs:
@@ -34,8 +34,9 @@ jobs:
   checkin:
     name: Online Hopegoo check-in and SMS
     runs-on: ubuntu-latest
-    # One 30-second request per account, plus setup and notification time.
-    timeout-minutes: 10
+    # Up to 20 minutes of jitter, 9 account gaps of at most 20 seconds,
+    # 10 requests of 30 seconds each, plus setup and notification time.
+    timeout-minutes: 35
     env:
       HOPEGOO_ACCOUNT_SLOT: ${{ github.event_name == 'schedule' && 'all' || inputs.account || 'all' }}
     steps:
@@ -43,9 +44,19 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: '3.13'
+      - name: Spread scheduled requests
+        if: github.event_name == 'schedule'
+        run: |
+          python - <<'PY'
+          import secrets, time
+          delay = secrets.randbelow(1201)
+          print(f'定时签到随机等待 {delay} 秒', flush=True)
+          time.sleep(delay)
+          PY
       - name: Submit check-in once
         env:
           HOPEGOO_MODE: ${{ github.event_name == 'schedule' && 'checkin' || inputs.mode || 'checkin' }}
+          HOPEGOO_PACED: ${{ github.event_name == 'schedule' && 'true' || 'false' }}
           HOPEGOO_ACCOUNT_01: ${{ secrets.HOPEGOO_ACCOUNT_01 }}
           HOPEGOO_ACCOUNT_02: ${{ secrets.HOPEGOO_ACCOUNT_02 }}
           HOPEGOO_ACCOUNT_03: ${{ secrets.HOPEGOO_ACCOUNT_03 }}
@@ -56,7 +67,12 @@ jobs:
           HOPEGOO_ACCOUNT_08: ${{ secrets.HOPEGOO_ACCOUNT_08 }}
           HOPEGOO_ACCOUNT_09: ${{ secrets.HOPEGOO_ACCOUNT_09 }}
           HOPEGOO_ACCOUNT_10: ${{ secrets.HOPEGOO_ACCOUNT_10 }}
-        run: python checkin.py --mode "$HOPEGOO_MODE" --account "$HOPEGOO_ACCOUNT_SLOT" --report "$RUNNER_TEMP/hopegoo-report.json"
+        run: |
+          pacing=()
+          if [ "$HOPEGOO_PACED" = true ]; then
+            pacing+=(--paced)
+          fi
+          python checkin.py --mode "$HOPEGOO_MODE" --account "$HOPEGOO_ACCOUNT_SLOT" --report "$RUNNER_TEMP/hopegoo-report.json" "${pacing[@]}"
       - name: Always submit cmcc SMS summary
         if: always() && (github.event_name == 'schedule' || inputs.mode == 'checkin')
         env:

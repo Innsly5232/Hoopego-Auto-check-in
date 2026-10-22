@@ -12,9 +12,11 @@ import json
 import os
 from pathlib import Path
 import re
+import secrets
 import socket
 import ssl
 import sys
+import time
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, timedelta
 from typing import Any, Mapping
@@ -340,8 +342,9 @@ def check_account(account: Account, transport: HttpTransport, mode: str, today: 
 
 
 def run_accounts(environment: Mapping[str, str], transport: HttpTransport, mode: str, today: date,
-                 selected_slot: int | None = None) -> list[Result]:
+                 selected_slot: int | None = None, *, paced: bool = False) -> list[Result]:
     results = []
+    attempted = False
     slots = range(1, 11) if selected_slot is None else (selected_slot,)
     for slot in slots:
         raw = environment.get(f"HOPEGOO_ACCOUNT_{slot:02d}", "")
@@ -349,6 +352,11 @@ def run_accounts(environment: Mapping[str, str], transport: HttpTransport, mode:
             continue
         try:
             account = Account.from_secret(raw, slot)
+            if paced and mode == "checkin" and attempted:
+                delay = 5 + secrets.randbelow(16)
+                print(f"{account.label}：账号间隔等待 {delay} 秒")
+                time.sleep(delay)
+            attempted = True
             results.append(check_account(account, transport, mode, today))
         except SafeError as error:
             results.append(Result(f"{slot:02d}", "failed", reason=str(error)))
@@ -520,6 +528,7 @@ def main(argv: list[str] | None = None) -> int:
                         default="all", help="只运行指定账号；默认运行全部已配置账号")
     parser.add_argument("--report", type=Path, default=Path("hopegoo-report.json"))
     parser.add_argument("--notify", action="store_true", help="Send summary from report; create failure summary if missing")
+    parser.add_argument("--paced", action="store_true", help="签到账号之间随机等待 5–20 秒；查询及通知不等待")
     args = parser.parse_args(argv)
     mask_credentials(os.environ)
     today = current_date()
@@ -549,7 +558,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"运行日期（北京时间）：{today.isoformat()}")
     print(f"运行账号：{args.account}")
     selected_slot = None if args.account == "all" else int(args.account)
-    results = run_accounts(os.environ, transport, args.mode, today, selected_slot)
+    results = run_accounts(os.environ, transport, args.mode, today, selected_slot, paced=args.paced)
     write_report(args.report, results, today, args.mode)
     summarize_results(results, today)
     for item in results:

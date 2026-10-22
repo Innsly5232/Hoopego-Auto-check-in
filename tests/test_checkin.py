@@ -55,6 +55,35 @@ class CheckinTests(unittest.TestCase):
     def setUp(self):
         self.account = checkin.Account.from_secret(secret(), 1)
 
+    def test_pacing_keeps_one_submission_per_valid_account_after_failure(self):
+        environment = {"HOPEGOO_ACCOUNT_01": secret(), "HOPEGOO_ACCOUNT_02": "invalid",
+                       "HOPEGOO_ACCOUNT_03": secret("dummy-second-session")}
+        for offset in (0, 15):
+            with self.subTest(offset=offset):
+                transport = FakeTransport({"status": 80001}, {"status": 200, "body": {"coins": 5}})
+                with mock.patch("checkin.secrets.randbelow", return_value=offset) as random, \
+                        mock.patch("checkin.time.sleep") as sleep:
+                    results = checkin.run_accounts(environment, transport, "checkin", TODAY, paced=True)
+                random.assert_called_once_with(16)
+                sleep.assert_called_once_with(5 + offset)
+                self.assertEqual([r.status for r in results], ["failed", "failed", "success"])
+                self.assertEqual([url for url, _, _ in transport.calls], [checkin.SIGNIN_URL] * 2)
+
+    def test_pacing_does_not_delay_query_default_or_single_account(self):
+        environment = {"HOPEGOO_ACCOUNT_01": secret(), "HOPEGOO_ACCOUNT_02": secret("dummy-second-session")}
+        cases = [("query", True, None), ("checkin", False, None), ("checkin", True, 2)]
+        for mode, paced, slot in cases:
+            with self.subTest(mode=mode, paced=paced, slot=slot):
+                count = 1 if slot else 2
+                response = calendar(True, 2) if mode == "query" else {"status": 80002}
+                transport = FakeTransport(*([response] * count))
+                with mock.patch("checkin.secrets.randbelow") as random, mock.patch("checkin.time.sleep") as sleep:
+                    results = checkin.run_accounts(environment, transport, mode, TODAY, slot, paced=paced)
+                random.assert_not_called()
+                sleep.assert_not_called()
+                self.assertEqual(len(results), count)
+                self.assertEqual(len(transport.calls), count)
+
     def test_direct_success_uses_only_submission_response(self):
         for body, coins, days in [({"coins": 5, "continuousDays": 3}, 5, 3), ({}, None, None), (None, None, None)]:
             with self.subTest(body=body):
