@@ -55,6 +55,14 @@ class CheckinTests(unittest.TestCase):
     def setUp(self):
         self.account = checkin.Account.from_secret(secret(), 1)
 
+    def test_hermes_route_takes_priority(self):
+        transport = FakeTransport()
+        with mock.patch("hermes_notify.send") as deliver:
+            checkin.push_message({"HERMES_WEBHOOK_SECRET": "test-secret"}, transport, "title", "content")
+        deliver.assert_called_once()
+        self.assertEqual(deliver.call_args.kwargs["route"], "github-hopegoo")
+        self.assertEqual(transport.calls, [])
+
     def test_pacing_keeps_one_submission_per_valid_account_after_failure(self):
         environment = {"HOPEGOO_ACCOUNT_01": secret(), "HOPEGOO_ACCOUNT_02": "invalid",
                        "HOPEGOO_ACCOUNT_03": secret("dummy-second-session")}

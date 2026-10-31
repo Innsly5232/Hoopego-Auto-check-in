@@ -460,6 +460,13 @@ def read_report(path: Path, today: date) -> list[Result]:
 
 
 def push_message(environment: Mapping[str, str], transport: HttpTransport, title: str, content: str) -> None:
+    if environment.get("HERMES_WEBHOOK_SECRET"):
+        try:
+            import hermes_notify
+            hermes_notify.send(title, content, route="github-hopegoo", environment=environment)
+            return
+        except Exception:
+            raise SafeError("Hermes 微信通知未确认，请检查 Actions 状态") from None
     token = environment.get("PUSHPLUS_TOKEN", "").strip()
     if not token:
         raise SafeError("PUSHPLUS_TOKEN 未配置，无法提交短信")
@@ -547,8 +554,12 @@ def main(argv: list[str] | None = None) -> int:
             print("通知步骤执行异常", file=sys.stderr)
             append_step_summary("\n**短信提交失败：**通知步骤执行异常")
             return 1
-        print("PushPlus 已接受通知请求；最终送达状态请在 PushPlus 查询。")
-        append_step_summary("\n**短信：**PushPlus 已接受 cmcc 通知请求；最终送达以手机和 PushPlus 记录为准。")
+        if os.environ.get("HERMES_WEBHOOK_SECRET"):
+            print("Hermes 已确认微信通知投递。")
+            append_step_summary("\n**微信：**Hermes 已确认通知投递。")
+        else:
+            print("PushPlus 已接受通知请求；最终送达状态请在 PushPlus 查询。")
+            append_step_summary("\n**短信：**PushPlus 已接受 cmcc 通知请求；最终送达以手机和 PushPlus 记录为准。")
         return 0
     descriptions = {
         "query": "仅一次联网查询，不提交签到、不重试",

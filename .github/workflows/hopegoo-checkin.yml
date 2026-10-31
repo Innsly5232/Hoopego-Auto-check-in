@@ -32,7 +32,7 @@ concurrency:
 
 jobs:
   checkin:
-    name: Online Hopegoo check-in and SMS
+    name: Online Hopegoo check-in and notification
     runs-on: ubuntu-latest
     # Up to 20 minutes of jitter, 9 account gaps of at most 20 seconds,
     # 10 requests of 30 seconds each, plus setup and notification time.
@@ -73,11 +73,13 @@ jobs:
             pacing+=(--paced)
           fi
           python checkin.py --mode "$HOPEGOO_MODE" --account "$HOPEGOO_ACCOUNT_SLOT" --report "$RUNNER_TEMP/hopegoo-report.json" "${pacing[@]}"
-      - name: Always submit cmcc SMS summary
+      - name: Always submit notification summary
         if: always() && (github.event_name == 'schedule' || inputs.mode == 'checkin')
         env:
           PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
           PUSHPLUS_OPTION: ${{ vars.PUSHPLUS_OPTION }}
+          HERMES_WEBHOOK_SECRET: ${{ secrets.HERMES_WEBHOOK_SECRET }}
+          HERMES_WEBHOOK_SSH_KEY: ${{ secrets.HERMES_WEBHOOK_SSH_KEY }}
         shell: bash
         run: |
           if [ -f checkin.py ]; then
